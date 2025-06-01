@@ -198,45 +198,49 @@ struct PhotoGridCell: View {
 struct ImageDetailView: View {
     @EnvironmentObject var viewModel: PhotoGalleryViewModel
     @State private var currentIndex: Int = 0
+    @State private var dragOffset: CGSize = .zero
+    @State private var scale: CGFloat = 1.0
     
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
             
             VStack {
-                // Header
-                HStack {
-                    Button("Done") {
-                        viewModel.showingImageDetail = false
-                    }
-                    .foregroundColor(.white)
-                    .font(.headline)
-                    
-                    Spacer()
-                    
-                    Text("\(currentIndex + 1) of \(viewModel.photos.count)")
-                        .foregroundColor(.white)
-                        .font(.caption)
-                }
-                .padding()
+                Spacer()
                 
-                // Image Viewer - 移除 TabView，使用自定义实现
-                ZoomableImageView(
-                    photo: viewModel.photos[currentIndex],
-                    onPreviousPhoto: {
-                        if currentIndex > 0 {
-                            withAnimation(.easeInOut(duration: 0.3)) {
-                                currentIndex -= 1
-                            }
-                        }
-                    },
-                    onNextPhoto: {
-                        if currentIndex < viewModel.photos.count - 1 {
-                            withAnimation(.easeInOut(duration: 0.3)) {
-                                currentIndex += 1
-                            }
-                        }
+                // Image Viewer - 简单的 TabView 滑动
+                TabView(selection: $currentIndex) {
+                    ForEach(Array(viewModel.photos.enumerated()), id: \.element.id) { index, photo in
+                        SimpleImageView(photo: photo)
+                            .tag(index)
                     }
+                }
+                .tabViewStyle(.page(indexDisplayMode: .never))
+                .scaleEffect(scale)
+                .offset(x: dragOffset.width, y: dragOffset.height)
+                .gesture(
+                    DragGesture()
+                        .onChanged { value in
+                            // 只响应向下滑动
+                            if value.translation.height > 0 {
+                                dragOffset = value.translation
+                                // 根据拖拽距离计算缩放比例
+                                let dragProgress = min(value.translation.height / 200, 1.0)
+                                scale = 1.0 - (dragProgress * 0.3) // 最多缩小到70%
+                            }
+                        }
+                        .onEnded { value in
+                            // 如果向下滑动超过100像素，关闭详细视图
+                            if value.translation.height > 100 {
+                                viewModel.showingImageDetail = false
+                            } else {
+                                // 否则弹回原位
+                                withAnimation(.easeInOut(duration: 0.3)) {
+                                    dragOffset = .zero
+                                    scale = 1.0
+                                }
+                            }
+                        }
                 )
                 .onAppear {
                     if let selectedPhoto = viewModel.selectedPhotoItem,
@@ -245,45 +249,23 @@ struct ImageDetailView: View {
                     }
                 }
                 
-                // Page Indicator
-                if viewModel.photos.count > 1 {
-                    HStack(spacing: 8) {
-                        ForEach(0..<viewModel.photos.count, id: \.self) { index in
-                            Circle()
-                                .fill(currentIndex == index ? Color.white : Color.white.opacity(0.5))
-                                .frame(width: 8, height: 8)
-                        }
-                    }
-                    .padding(.bottom, 20)
-                }
+                Spacer()
+                
+                // 底部缩略图条 - iOS风格
+                FilmstripView(
+                    photos: viewModel.photos,
+                    currentIndex: $currentIndex
+                )
+                .opacity(1.0 - min(dragOffset.height / 100, 1.0)) // 滑动时淡出
+                .padding(.bottom, 50)
             }
         }
     }
 }
 
-// MARK: - Zoomable Image View
-struct ZoomableImageView: View {
+// MARK: - Simple Image View
+struct SimpleImageView: View {
     let photo: PhotoItem
-    let onPreviousPhoto: () -> Void
-    let onNextPhoto: () -> Void
-    
-    @State private var scale: CGFloat = 1.0
-    @State private var offset: CGSize = .zero
-    @State private var lastOffset: CGSize = .zero
-    @GestureState private var magnifyBy = 1.0
-    @GestureState private var dragOffset = CGSize.zero
-    
-    // 用于手势速度和边界检测
-    @State private var dragStartTime: Date = Date()
-    @State private var dragStartLocation: CGPoint = .zero
-    @State private var imageSize: CGSize = .zero
-    @State private var containerSize: CGSize = .zero
-    
-    // 交互参数
-    private let scaleThreshold: CGFloat = 1.05
-    private let velocityThreshold: Double = 200
-    private let minimumSwipeDistance: CGFloat = 50
-    private let boundaryTolerance: CGFloat = 20
     
     var body: some View {
         GeometryReader { geometry in
@@ -291,149 +273,107 @@ struct ZoomableImageView: View {
                 .resizable()
                 .aspectRatio(contentMode: .fit)
                 .frame(width: geometry.size.width, height: geometry.size.height)
-                .scaleEffect(scale * magnifyBy)
-                .offset(
-                    x: offset.width + dragOffset.width,
-                    y: offset.height + dragOffset.height
-                )
-                .onAppear {
-                    containerSize = geometry.size
-                    calculateImageSize(containerSize: geometry.size)
-                }
-                .onChange(of: geometry.size) { newSize in
-                    containerSize = newSize
-                    calculateImageSize(containerSize: newSize)
-                }
-                .gesture(
-                    SimultaneousGesture(
-                        // 缩放手势
-                        MagnificationGesture()
-                            .updating($magnifyBy) { currentState, gestureState, _ in
-                                gestureState = currentState
-                            }
-                            .onEnded { value in
-                                scale *= value
-                                if scale < 1 {
-                                    withAnimation(.easeInOut) {
-                                        scale = 1
-                                        offset = .zero
-                                    }
-                                } else if scale > 5 {
-                                    scale = 5
-                                }
-                                // 缩放后重新计算边界
-                                constrainOffset()
-                            },
+        }
+    }
+}
+
+// MARK: - Filmstrip View (iOS Style)
+struct FilmstripView: View {
+    let photos: [PhotoItem]
+    @Binding var currentIndex: Int
+    
+    var body: some View {
+        GeometryReader { geometry in
+            let screenWidth = geometry.size.width
+            let thumbnailSize: CGFloat = 44
+            let spacing: CGFloat = 4
+            
+            ScrollViewReader { proxy in
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: spacing) {
+                        // 添加前导空白，让第一个缩略图能居中
+                        Spacer()
+                            .frame(width: (screenWidth - thumbnailSize) / 2)
                         
-                        // 拖拽手势
-                        DragGesture()
-                            .updating($dragOffset) { currentState, gestureState, _ in
-                                gestureState = currentState.translation
-                            }
-                            .onChanged { value in
-                                if dragStartTime.timeIntervalSinceNow < -0.1 {
-                                    dragStartTime = Date()
-                                    dragStartLocation = value.startLocation
+                        ForEach(Array(photos.enumerated()), id: \.element.id) { index, photo in
+                            FilmstripThumbnail(
+                                photo: photo,
+                                isSelected: index == currentIndex,
+                                size: thumbnailSize
+                            )
+                            .id(index)
+                            .onTapGesture {
+                                withAnimation(.easeInOut(duration: 0.3)) {
+                                    currentIndex = index
                                 }
                             }
-                            .onEnded { value in
-                                handleDragEnd(value: value)
-                            }
-                    )
-                )
-                .onTapGesture(count: 2) {
-                    withAnimation(.easeInOut) {
-                        if scale > scaleThreshold {
-                            scale = 1
-                            offset = .zero
-                        } else {
-                            scale = 2
-                            // 双击位置为中心进行缩放
-                            // 这里可以根据点击位置调整offset，暂时简化
                         }
+                        
+                        // 添加后导空白，让最后一个缩略图能居中
+                        Spacer()
+                            .frame(width: (screenWidth - thumbnailSize) / 2)
                     }
                 }
-        }
-    }
-    
-    private func calculateImageSize(containerSize: CGSize) {
-        let imageAspectRatio = photo.image.size.width / photo.image.size.height
-        let containerAspectRatio = containerSize.width / containerSize.height
-        
-        if imageAspectRatio > containerAspectRatio {
-            // 图片更宽，以容器宽度为准
-            imageSize = CGSize(
-                width: containerSize.width,
-                height: containerSize.width / imageAspectRatio
-            )
-        } else {
-            // 图片更高，以容器高度为准
-            imageSize = CGSize(
-                width: containerSize.height * imageAspectRatio,
-                height: containerSize.height
-            )
-        }
-    }
-    
-    private func handleDragEnd(value: DragGesture.Value) {
-        let dragDuration = Date().timeIntervalSince(dragStartTime)
-        let dragDistance = sqrt(pow(value.translation.x, 2) + pow(value.translation.y, 2))
-        let velocity = dragDistance / max(dragDuration, 0.01)
-        
-        // 如果图片未放大，左右滑动切换照片
-        if scale <= scaleThreshold {
-            if abs(value.translation.x) > minimumSwipeDistance && abs(value.translation.x) > abs(value.translation.y) {
-                if value.translation.x > 0 {
-                    onPreviousPhoto()
-                } else {
-                    onNextPhoto()
+                .onChange(of: currentIndex) { newIndex in
+                    // 主图切换时，自动滚动缩略图条让当前图片居中
+                    withAnimation(.easeInOut(duration: 0.3)) {
+                        proxy.scrollTo(newIndex, anchor: .center)
+                    }
                 }
-                return
-            }
-        } else {
-            // 图片已放大，检查是否在边界且为快速滑动
-            let currentOffsetWidth = offset.width + value.translation.x
-            let currentOffsetHeight = offset.height + value.translation.y
-            
-            let maxOffset = calculateMaxOffset()
-            let isAtLeftBoundary = currentOffsetWidth >= maxOffset.width - boundaryTolerance
-            let isAtRightBoundary = currentOffsetWidth <= -maxOffset.width + boundaryTolerance
-            
-            if velocity > velocityThreshold && abs(value.translation.x) > minimumSwipeDistance {
-                if value.translation.x > 0 && isAtLeftBoundary {
-                    onPreviousPhoto()
-                    return
-                } else if value.translation.x < 0 && isAtRightBoundary {
-                    onNextPhoto()
-                    return
+                .onAppear {
+                    // 初始时滚动到当前照片位置
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        proxy.scrollTo(currentIndex, anchor: .center)
+                    }
                 }
             }
+            
+            // 左右渐变遮罩效果
+            HStack {
+                LinearGradient(
+                    gradient: Gradient(colors: [Color.black, Color.clear]),
+                    startPoint: .leading,
+                    endPoint: .trailing
+                )
+                .frame(width: 20)
+                
+                Spacer()
+                
+                LinearGradient(
+                    gradient: Gradient(colors: [Color.clear, Color.black]),
+                    startPoint: .leading,
+                    endPoint: .trailing
+                )
+                .frame(width: 20)
+            }
+            .allowsHitTesting(false) // 不阻止点击事件
         }
-        
-        // 否则进行正常的图片移动
-        offset.width += value.translation.x
-        offset.height += value.translation.y
-        constrainOffset()
+        .frame(height: 60)
     }
+}
+
+// MARK: - Filmstrip Thumbnail
+struct FilmstripThumbnail: View {
+    let photo: PhotoItem
+    let isSelected: Bool
+    let size: CGFloat
     
-    private func calculateMaxOffset() -> CGSize {
-        let scaledImageSize = CGSize(
-            width: imageSize.width * scale,
-            height: imageSize.height * scale
-        )
-        
-        let maxOffsetWidth = max(0, (scaledImageSize.width - containerSize.width) / 2)
-        let maxOffsetHeight = max(0, (scaledImageSize.height - containerSize.height) / 2)
-        
-        return CGSize(width: maxOffsetWidth, height: maxOffsetHeight)
-    }
-    
-    private func constrainOffset() {
-        let maxOffset = calculateMaxOffset()
-        
-        withAnimation(.easeOut(duration: 0.2)) {
-            offset.width = min(maxOffset.width, max(-maxOffset.width, offset.width))
-            offset.height = min(maxOffset.height, max(-maxOffset.height, offset.height))
-        }
+    var body: some View {
+        Image(uiImage: photo.image)
+            .resizable()
+            .aspectRatio(contentMode: .fill)
+            .frame(width: size, height: size)
+            .clipped()
+            .cornerRadius(4)
+            .overlay(
+                RoundedRectangle(cornerRadius: 4)
+                    .stroke(
+                        isSelected ? Color.white : Color.white.opacity(0.3),
+                        lineWidth: isSelected ? 2 : 1
+                    )
+            )
+            .opacity(isSelected ? 1.0 : 0.6)
+            .scaleEffect(isSelected ? 1.0 : 0.85)
+            .animation(.easeInOut(duration: 0.2), value: isSelected)
     }
 }
