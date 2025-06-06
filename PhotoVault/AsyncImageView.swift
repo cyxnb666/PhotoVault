@@ -203,8 +203,9 @@ struct ThumbnailView: View {
                 )
         )
         .opacity(isSelected ? 1.0 : 0.6)
-        .scaleEffect(isSelected ? 1.0 : 0.85)
-        .animation(.easeInOut(duration: 0.2), value: isSelected)
+        // 移除这里的 scaleEffect 和 animation，让外层控制
+        // .scaleEffect(isSelected ? 1.0 : 0.85)
+        // .animation(.easeInOut(duration: 0.2), value: isSelected)
         .onAppear {
             loadThumbnail()
         }

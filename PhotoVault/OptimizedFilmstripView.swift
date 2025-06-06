@@ -1,6 +1,6 @@
 import SwiftUI
 
-// MARK: - Optimized Filmstrip View with Fixed Animation Conflicts
+// MARK: - Fixed Optimized Filmstrip View (No Conflicts)
 struct OptimizedFilmstripView: View {
     let photos: [PhotoItem]
     @Binding var currentIndex: Int
@@ -10,6 +10,7 @@ struct OptimizedFilmstripView: View {
     @State private var isDragging = false
     @State private var dragStartIndex = 0
     @State private var dragOffset: CGFloat = 0
+    @State private var animationID = UUID() // 用于避免动画冲突
     
     private let thumbnailSize: CGFloat = 44
     private let spacing: CGFloat = 4
@@ -41,17 +42,25 @@ struct OptimizedFilmstripView: View {
                 Spacer().frame(width: leadingPadding)
                 
                 ForEach(Array(photos.enumerated()), id: \.element.id) { index, photo in
+                    // 使用现有的 ThumbnailView，但控制其动画
                     ThumbnailView(
                         fileName: photo.fileName,
                         size: thumbnailSize,
                         isSelected: index == currentIndex
                     )
+                    // 在这里控制动画，避免传递 isDragging 参数
                     .scaleEffect(index == currentIndex ? 1.0 : 0.85)
-                    .animation(.easeInOut(duration: 0.2), value: currentIndex)
+                    .animation(
+                        isDragging ? .none : .easeInOut(duration: 0.2),
+                        value: currentIndex
+                    )
                     .onTapGesture {
-                        // 点击缩略图直接跳转
+                        // 点击缩略图直接跳转（只在非拖拽状态下）
                         if !isDragging {
-                            currentIndex = index
+                            withAnimation(.easeInOut(duration: 0.3)) {
+                                currentIndex = index
+                                animationID = UUID() // 更新动画ID
+                            }
                         }
                     }
                 }
@@ -59,6 +68,7 @@ struct OptimizedFilmstripView: View {
                 Spacer().frame(width: leadingPadding)
             }
             .offset(x: calculateScrollOffset(itemWidth: itemWidth))
+            .id(animationID) // 使用ID来重置动画状态
         }
         .overlay(
             dragGestureOverlay(itemWidth: itemWidth)
@@ -71,14 +81,14 @@ struct OptimizedFilmstripView: View {
         }
     }
     
-    // MARK: - 位置计算（避免动画冲突）
+    // MARK: - 位置计算（修复动画冲突）
     private func calculateScrollOffset(itemWidth: CGFloat) -> CGFloat {
         if isDragging {
-            // 拖拽时：基础位置 + 拖拽偏移
+            // 拖拽时：基础位置 + 拖拽偏移（无动画）
             let basePosition = -CGFloat(dragStartIndex) * itemWidth
             return basePosition + dragOffset
         } else {
-            // 非拖拽时：根据当前索引计算位置
+            // 非拖拽时：根据当前索引计算位置（带动画）
             return -CGFloat(currentIndex) * itemWidth
         }
     }
@@ -88,7 +98,7 @@ struct OptimizedFilmstripView: View {
         Rectangle()
             .fill(Color.clear)
             .contentShape(Rectangle())
-            .gesture(
+            .simultaneousGesture( // 使用simultaneousGesture避免冲突
                 DragGesture(coordinateSpace: .local)
                     .onChanged { value in
                         handleDragChanged(value, itemWidth: itemWidth)
@@ -99,7 +109,7 @@ struct OptimizedFilmstripView: View {
             )
     }
     
-    // MARK: - 手势处理（无动画冲突）
+    // MARK: - 修复的手势处理
     private func handleDragChanged(_ value: DragGesture.Value, itemWidth: CGFloat) {
         if !isDragging {
             startDragging()
@@ -108,13 +118,15 @@ struct OptimizedFilmstripView: View {
         // 更新拖拽偏移（不使用动画）
         dragOffset = value.translation.width
         
-        // 计算目标索引
+        // 计算目标索引（减少频繁更新）
         let indexChange = -value.translation.width / itemWidth
         let targetIndex = dragStartIndex + Int(round(indexChange))
         let newIndex = max(0, min(photos.count - 1, targetIndex))
         
-        // 只在索引真正改变时更新（避免频繁触发）
-        if newIndex != currentIndex {
+        // 只在索引真正改变且变化幅度足够大时更新
+        let minimumDragDistance: CGFloat = itemWidth * 0.3 // 需要拖拽30%的距离才触发
+        if newIndex != currentIndex && abs(value.translation.width) > minimumDragDistance {
+            // 使用无动画的方式更新索引
             currentIndex = newIndex
             provideTactileFeedback(for: newIndex)
         }
@@ -123,37 +135,52 @@ struct OptimizedFilmstripView: View {
     private func handleDragEnded(_ value: DragGesture.Value, itemWidth: CGFloat) {
         let velocity = value.predictedEndTranslation.width
         
-        // 基于速度的最终调整
-        if abs(velocity) > 300 { // 只有很快的滑动才会额外移动
-            let direction = velocity > 0 ? -1 : 1
-            let newIndex = max(0, min(photos.count - 1, currentIndex + direction))
-            currentIndex = newIndex
+        // 基于速度和距离的最终调整
+        let dragDistance = value.translation.width
+        let indexChange = -dragDistance / itemWidth
+        var targetIndex = dragStartIndex + Int(round(indexChange))
+        
+        // 速度补偿：高速滑动时额外移动一格
+        if abs(velocity) > 500 { // 降低速度阈值避免误触
+            let velocityDirection = velocity > 0 ? -1 : 1
+            targetIndex += velocityDirection
         }
+        
+        // 确保索引在有效范围内
+        targetIndex = max(0, min(photos.count - 1, targetIndex))
+        
+        // 更新最终索引
+        currentIndex = targetIndex
         
         // 结束拖拽，触发最终动画
         finishDragging()
     }
     
-    // MARK: - 状态管理
+    // MARK: - 状态管理（修复动画）
     private func startDragging() {
+        // 准备触觉反馈
+        hapticFeedback.prepare()
+        lastHapticIndex = currentIndex
+        
+        // 无动画地进入拖拽状态
         isDragging = true
         dragStartIndex = currentIndex
         dragOffset = 0
-        hapticFeedback.prepare()
-        lastHapticIndex = currentIndex
     }
     
     private func finishDragging() {
-        // 使用单一动画重置到最终位置
-        withAnimation(.easeOut(duration: 0.25)) {
+        // 使用单一、平滑的动画回到最终位置
+        withAnimation(.easeOut(duration: 0.3)) {
             isDragging = false
             dragOffset = 0
+            animationID = UUID() // 更新动画ID，重置动画状态
         }
         
+        // 重置触觉反馈状态
         lastHapticIndex = -1
         
-        // 预加载最终位置附近的缩略图
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+        // 延迟预加载，避免动画期间的性能问题
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
             preloadNearbyThumbnails()
         }
     }

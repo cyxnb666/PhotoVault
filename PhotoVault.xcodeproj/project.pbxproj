@@ -27,6 +27,8 @@
 		C36684AC2DEC5FEE00019D6A /* PhotoVault.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = PhotoVault.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		C36684B92DEC5FEF00019D6A /* PhotoVaultTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = PhotoVaultTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		C36684C32DEC5FEF00019D6A /* PhotoVaultUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = PhotoVaultUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		C3AAA3182DF3137100A0B363 /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
+		C3AAA31A2DF3137800A0B363 /* MetalKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = MetalKit.framework; path = System/Library/Frameworks/MetalKit.framework; sourceTree = SDKROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -78,6 +80,7 @@
 				C36684AE2DEC5FEE00019D6A /* PhotoVault */,
 				C36684BC2DEC5FEF00019D6A /* PhotoVaultTests */,
 				C36684C62DEC5FEF00019D6A /* PhotoVaultUITests */,
+				C3AAA3172DF3137100A0B363 /* Frameworks */,
 				C36684AD2DEC5FEE00019D6A /* Products */,
 			);
 			sourceTree = "<group>";
@@ -90,6 +93,15 @@
 				C36684C32DEC5FEF00019D6A /* PhotoVaultUITests.xctest */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		C3AAA3172DF3137100A0B363 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				C3AAA31A2DF3137800A0B363 /* MetalKit.framework */,
+				C3AAA3182DF3137100A0B363 /* Metal.framework */,
+			);
+			name = Frameworks;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
