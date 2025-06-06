@@ -6,6 +6,11 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		C3AAA3302DF327CA00A0B363 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C3AAA3182DF3137100A0B363 /* Metal.framework */; };
+		C3AAA3312DF327D100A0B363 /* MetalKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C3AAA31A2DF3137800A0B363 /* MetalKit.framework */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXContainerItemProxy section */
 		C36684BA2DEC5FEF00019D6A /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -54,6 +59,8 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				C3AAA3312DF327D100A0B363 /* MetalKit.framework in Frameworks */,
+				C3AAA3302DF327CA00A0B363 /* Metal.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

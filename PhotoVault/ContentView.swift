@@ -335,10 +335,17 @@ struct ContentView: View {
                             }
                         }
                     } else {
-                        EmptyView()
+                        HStack {
+                            // 添加性能监控按钮（可选）
+                            PerformanceMonitorButton()
+                            
+                            // 可选：添加状态指示器
+                            StatusBadge(isMetalEnabled: MetalImageProcessor.isSupported)
+                        }
                     }
                 }
                 
+                // 其他toolbar items保持不变...
                 ToolbarItem(placement: .navigationBarTrailing) {
                     HStack {
                         if viewModel.isSelectionMode {
@@ -436,15 +443,16 @@ struct EmptyStateView: View {
 struct PhotoGridView: View {
     @EnvironmentObject var viewModel: PhotoGalleryViewModel
     
+    // 调整为更紧凑的布局
     let columns = [
-        GridItem(.flexible(), spacing: 2),
-        GridItem(.flexible(), spacing: 2),
-        GridItem(.flexible(), spacing: 2)
+        GridItem(.flexible(), spacing: 1),  // 减少spacing从2到1
+        GridItem(.flexible(), spacing: 1),
+        GridItem(.flexible(), spacing: 1)
     ]
     
     var body: some View {
         ScrollView {
-            LazyVGrid(columns: columns, spacing: 2) {
+            LazyVGrid(columns: columns, spacing: 1) {  // 减少垂直spacing从2到1
                 ForEach(viewModel.photos) { photo in
                     PhotoGridCell(photo: photo)
                         .onAppear {
@@ -457,7 +465,7 @@ struct PhotoGridView: View {
                         }
                 }
             }
-            .padding(8)
+            .padding(4)  // 减少外边距从8到4
         }
         .onAppear {
             // 视图出现时开始预加载
