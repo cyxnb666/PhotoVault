@@ -2,21 +2,12 @@ import SwiftUI
 import PhotosUI
 import UniformTypeIdentifiers
 
-// MARK: - Models
+// MARK: - Optimized PhotoItem Model
 struct PhotoItem: Identifiable, Hashable, Codable {
     let id = UUID()
     let fileName: String
     
-    var image: UIImage? {
-        guard let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
-            return nil
-        }
-        let imagePath = documentsPath.appendingPathComponent(fileName)
-        guard let imageData = try? Data(contentsOf: imagePath) else {
-            return nil
-        }
-        return UIImage(data: imageData)
-    }
+    // 移除原来的 image computed property，现在通过缓存系统获取图片
     
     init(image: UIImage) {
         self.fileName = "\(UUID().uuidString).jpg"
@@ -33,8 +24,11 @@ struct PhotoItem: Identifiable, Hashable, Codable {
         }
         let imagePath = documentsPath.appendingPathComponent(fileName)
         
-        if let imageData = image.jpegData(compressionQuality: 0.8) {
-            try? imageData.write(to: imagePath)
+        // 后台保存图片，避免阻塞主线程
+        DispatchQueue.global(qos: .utility).async {
+            if let imageData = image.jpegData(compressionQuality: 0.8) {
+                try? imageData.write(to: imagePath)
+            }
         }
     }
     
@@ -43,7 +37,30 @@ struct PhotoItem: Identifiable, Hashable, Codable {
             return
         }
         let imagePath = documentsPath.appendingPathComponent(fileName)
+        
+        // 从缓存中移除
+        ImageCache.shared.removeCachedImage(for: fileName)
+        
+        // 删除文件
         try? FileManager.default.removeItem(at: imagePath)
+    }
+    
+    // MARK: - 缓存辅助方法
+    func loadImageAsync(completion: @escaping (UIImage?) -> Void) {
+        ImageCache.shared.getImageAsync(for: fileName, completion: completion)
+    }
+    
+    func loadThumbnail(size: CGSize, completion: @escaping (UIImage?) -> Void) {
+        ImageCache.shared.getThumbnail(for: fileName, size: size, completion: completion)
+    }
+    
+    // 检查文件是否存在
+    var fileExists: Bool {
+        guard let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
+            return false
+        }
+        let imagePath = documentsPath.appendingPathComponent(fileName)
+        return FileManager.default.fileExists(atPath: imagePath.path)
     }
     
     // Hashable conformance
@@ -95,7 +112,7 @@ struct DocumentPickerView: UIViewControllerRepresentable {
     }
 }
 
-// MARK: - View Model
+// MARK: - Optimized View Model
 class PhotoGalleryViewModel: ObservableObject {
     @Published var photos: [PhotoItem] = []
     @Published var selectedPhotoItem: PhotoItem?
@@ -116,25 +133,32 @@ class PhotoGalleryViewModel: ObservableObject {
         UserDefaults.standard.set(fileNames, forKey: photosKey)
     }
     
+    // 改进的loadSavedPhotos方法，包含验证和预加载
     private func loadSavedPhotos() {
         guard let savedFileNames = UserDefaults.standard.array(forKey: photosKey) as? [String] else {
             return
         }
         
-        let loadedPhotos = savedFileNames.compactMap { fileName -> PhotoItem? in
-            let photoItem = PhotoItem(fileName: fileName)
-            // 验证文件是否存在
-            return photoItem.image != nil ? photoItem : nil
+        // 后台验证文件存在性
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let validPhotos = savedFileNames.compactMap { fileName -> PhotoItem? in
+                let photoItem = PhotoItem(fileName: fileName)
+                return photoItem.fileExists ? photoItem : nil
+            }
+            
+            DispatchQueue.main.async {
+                self?.photos = validPhotos
+                // 开始预加载缩略图
+                self?.preloadThumbnails()
+            }
         }
-        
-        self.photos = loadedPhotos
     }
     
+    // 改进的loadPhotosFromFolder方法，包含进度反馈
     func loadPhotosFromFolder(at url: URL) {
         Task {
             var newPhotos: [PhotoItem] = []
             
-            // 开始访问安全范围资源
             guard url.startAccessingSecurityScopedResource() else {
                 print("无法访问所选文件夹")
                 return
@@ -145,31 +169,41 @@ class PhotoGalleryViewModel: ObservableObject {
             }
             
             do {
-                // 获取文件夹中的所有内容
                 let fileManager = FileManager.default
                 let contents = try fileManager.contentsOfDirectory(at: url, includingPropertiesForKeys: [.contentTypeKey], options: [.skipsHiddenFiles])
                 
-                // 支持的图片格式
                 let supportedImageTypes: [UTType] = [.jpeg, .png, .heic, .gif, .bmp, .tiff]
                 
-                for fileURL in contents {
-                    // 检查文件类型是否为图片
-                    if let resourceValues = try? fileURL.resourceValues(forKeys: [.contentTypeKey]),
-                       let contentType = resourceValues.contentType,
-                       supportedImageTypes.contains(where: { contentType.conforms(to: $0) }) {
-                        
-                        // 读取图片数据
-                        if let imageData = try? Data(contentsOf: fileURL),
-                           let image = UIImage(data: imageData) {
-                            let photoItem = PhotoItem(image: image)
-                            newPhotos.append(photoItem)
+                // 分批处理图片，避免内存峰值
+                let batchSize = 10
+                for batch in contents.chunked(into: batchSize) {
+                    for fileURL in batch {
+                        if let resourceValues = try? fileURL.resourceValues(forKeys: [.contentTypeKey]),
+                           let contentType = resourceValues.contentType,
+                           supportedImageTypes.contains(where: { contentType.conforms(to: $0) }) {
+                            
+                            if let imageData = try? Data(contentsOf: fileURL),
+                               let image = UIImage(data: imageData) {
+                                let photoItem = PhotoItem(image: image)
+                                newPhotos.append(photoItem)
+                            }
                         }
                     }
+                    
+                    // 每处理一批就更新UI并短暂休息
+                    await MainActor.run {
+                        self.photos.append(contentsOf: newPhotos)
+                        newPhotos.removeAll()
+                        self.savePhotos()
+                    }
+                    
+                    // 短暂休息，避免阻塞主线程
+                    try? await Task.sleep(nanoseconds: 10_000_000) // 10ms
                 }
                 
                 await MainActor.run {
-                    self.photos.append(contentsOf: newPhotos)
-                    self.savePhotos() // 保存到本地
+                    // 开始预加载新添加的照片的缩略图
+                    self.preloadThumbnails()
                 }
                 
             } catch {
@@ -219,9 +253,16 @@ class PhotoGalleryViewModel: ObservableObject {
         selectedPhotos.removeAll()
     }
     
+    // 改进的selectPhoto方法，包含预加载
     func selectPhoto(_ photo: PhotoItem) {
         selectedPhotoItem = photo
         showingImageDetail = true
+        
+        // 找到选中照片的索引并预加载附近的图片
+        if let index = photos.firstIndex(where: { $0.id == photo.id }) {
+            preloadNearbyHighResImages(around: index)
+        }
+        
         // 进入图片详细视图时退出选择模式
         if isSelectionMode {
             isSelectionMode = false
@@ -231,6 +272,40 @@ class PhotoGalleryViewModel: ObservableObject {
     
     func showDocumentPicker() {
         showingDocumentPicker = true
+    }
+    
+    // MARK: - Performance Optimization Methods
+    
+    // 预加载缩略图
+    func preloadThumbnails() {
+        let thumbnailSize = CGSize(width: 240, height: 240) // Grid用的缩略图
+        let fileNames = photos.map { $0.fileName }
+        
+        DispatchQueue.global(qos: .utility).async {
+            ImageCache.shared.preloadThumbnails(for: fileNames, size: thumbnailSize)
+        }
+    }
+    
+    // 预加载当前照片附近的高分辨率图片（用于详细视图）
+    func preloadNearbyHighResImages(around index: Int) {
+        let range = max(0, index - 2)...min(photos.count - 1, index + 2)
+        
+        for i in range {
+            if i < photos.count {
+                photos[i].loadImageAsync { _ in
+                    // 预加载，不需要处理结果
+                }
+            }
+        }
+    }
+}
+
+// 数组分批扩展
+extension Array {
+    func chunked(into size: Int) -> [[Element]] {
+        return stride(from: 0, to: count, by: size).map {
+            Array(self[$0..<Swift.min($0 + size, count)])
+        }
     }
 }
 
@@ -357,7 +432,7 @@ struct EmptyStateView: View {
     }
 }
 
-// MARK: - Photo Grid View
+// MARK: - Optimized Photo Grid View
 struct PhotoGridView: View {
     @EnvironmentObject var viewModel: PhotoGalleryViewModel
     
@@ -372,14 +447,39 @@ struct PhotoGridView: View {
             LazyVGrid(columns: columns, spacing: 2) {
                 ForEach(viewModel.photos) { photo in
                     PhotoGridCell(photo: photo)
+                        .onAppear {
+                            // 当item出现时，预加载附近的缩略图
+                            preloadNearbyThumbnails(for: photo)
+                        }
+                        .onDisappear {
+                            // 当item消失时，可以清理一些不必要的缓存
+                            // 但我们保留缓存以提高性能
+                        }
                 }
             }
             .padding(8)
         }
+        .onAppear {
+            // 视图出现时开始预加载
+            viewModel.preloadThumbnails()
+        }
+    }
+    
+    private func preloadNearbyThumbnails(for photo: PhotoItem) {
+        guard let currentIndex = viewModel.photos.firstIndex(where: { $0.id == photo.id }) else { return }
+        
+        // 预加载当前照片前后5张的缩略图
+        let range = max(0, currentIndex - 5)...min(viewModel.photos.count - 1, currentIndex + 5)
+        let nearbyPhotos = range.map { viewModel.photos[$0].fileName }
+        
+        ImageCache.shared.preloadThumbnails(
+            for: nearbyPhotos,
+            size: CGSize(width: 240, height: 240)
+        )
     }
 }
 
-// MARK: - Photo Grid Cell
+// MARK: - Optimized Photo Grid Cell
 struct PhotoGridCell: View {
     let photo: PhotoItem
     @EnvironmentObject var viewModel: PhotoGalleryViewModel
@@ -391,42 +491,35 @@ struct PhotoGridCell: View {
     var body: some View {
         GeometryReader { geometry in
             ZStack(alignment: .topTrailing) {
-                if let image = photo.image {
-                    Image(uiImage: image)
-                        .resizable()
-                        .aspectRatio(contentMode: .fill)
-                        .frame(width: geometry.size.width, height: geometry.size.height)
-                        .clipped()
-                        .cornerRadius(12)
-                        .onTapGesture {
-                            if viewModel.isSelectionMode {
-                                viewModel.togglePhotoSelection(photo)
-                            } else {
-                                viewModel.selectPhoto(photo)
-                            }
-                        }
-                        .overlay(
-                            // 选择模式下的遮罩
-                            RoundedRectangle(cornerRadius: 12)
-                                .fill(Color.blue.opacity(viewModel.isSelectionMode && isSelected ? 0.3 : 0))
-                        )
-                        .overlay(
-                            // 选择边框
-                            RoundedRectangle(cornerRadius: 12)
-                                .stroke(Color.blue, lineWidth: viewModel.isSelectionMode && isSelected ? 3 : 0)
-                        )
-                } else {
-                    // 占位图片，如果图片加载失败
-                    Rectangle()
-                        .fill(Color.gray.opacity(0.3))
-                        .frame(width: geometry.size.width, height: geometry.size.height)
-                        .cornerRadius(12)
-                        .overlay(
-                            Image(systemName: "photo")
-                                .foregroundColor(.gray)
-                                .font(.title)
-                        )
+                // 使用新的AsyncImageView替代原来的同步图片加载
+                AsyncImageView(
+                    fileName: photo.fileName,
+                    targetSize: CGSize(
+                        width: geometry.size.width * 2, // 2x for retina
+                        height: geometry.size.height * 2
+                    ),
+                    contentMode: .fill
+                )
+                .frame(width: geometry.size.width, height: geometry.size.height)
+                .clipped()
+                .cornerRadius(12)
+                .onTapGesture {
+                    if viewModel.isSelectionMode {
+                        viewModel.togglePhotoSelection(photo)
+                    } else {
+                        viewModel.selectPhoto(photo)
+                    }
                 }
+                .overlay(
+                    // 选择模式下的遮罩
+                    RoundedRectangle(cornerRadius: 12)
+                        .fill(Color.blue.opacity(viewModel.isSelectionMode && isSelected ? 0.3 : 0))
+                )
+                .overlay(
+                    // 选择边框
+                    RoundedRectangle(cornerRadius: 12)
+                        .stroke(Color.blue, lineWidth: viewModel.isSelectionMode && isSelected ? 3 : 0)
+                )
                 
                 if viewModel.isSelectionMode {
                     // 选择指示器
@@ -518,8 +611,8 @@ struct ImageDetailView: View {
                     
                     Spacer()
                     
-                    // 底部缩略图条 - iOS风格
-                    FilmstripView(
+                    // 底部缩略图条 - 使用优化版本
+                    OptimizedFilmstripView(
                         photos: viewModel.photos,
                         currentIndex: $currentIndex
                     )
@@ -554,275 +647,11 @@ struct ImageDetailView: View {
     }
 }
 
-// MARK: - Simple Image View
+// MARK: - Optimized Simple Image View
 struct SimpleImageView: View {
     let photo: PhotoItem
     
     var body: some View {
-        GeometryReader { geometry in
-            if let image = photo.image {
-                Image(uiImage: image)
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .frame(width: geometry.size.width, height: geometry.size.height)
-            } else {
-                // 占位图片，如果图片加载失败
-                Rectangle()
-                    .fill(Color.gray.opacity(0.3))
-                    .frame(width: geometry.size.width, height: geometry.size.height)
-                    .overlay(
-                        Image(systemName: "photo")
-                            .foregroundColor(.gray)
-                            .font(.system(size: 60))
-                    )
-            }
-        }
-    }
-}
-
-// MARK: - Filmstrip View (iOS Style Thumbnail Scrubber)
-struct FilmstripView: View {
-    let photos: [PhotoItem]
-    @Binding var currentIndex: Int
-    @State private var hapticFeedback = UIImpactFeedbackGenerator(style: .light)
-    @State private var lastHapticIndex = -1
-    @State private var isDragging = false
-    @State private var dragStartIndex = 0
-    @State private var currentScrollOffset: CGFloat = 0
-    
-    var body: some View {
-        GeometryReader { geometry in
-            let screenWidth = geometry.size.width
-            let thumbnailSize: CGFloat = 44
-            let spacing: CGFloat = 4
-            let totalThumbnailWidth = thumbnailSize + spacing
-            let leadingPadding = max(0, (screenWidth - thumbnailSize) / 2)
-            
-            ScrollViewReader { proxy in
-                ZStack {
-                    // 可滚动的缩略图ScrollView
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: spacing) {
-                            // 前导空白
-                            Spacer()
-                                .frame(width: leadingPadding)
-                            
-                            ForEach(Array(photos.enumerated()), id: \.element.id) { index, photo in
-                                FilmstripThumbnail(
-                                    photo: photo,
-                                    isSelected: index == currentIndex,
-                                    size: thumbnailSize,
-                                    isDragging: isDragging
-                                )
-                                .id(index)
-                            }
-                            
-                            // 后导空白
-                            Spacer()
-                                .frame(width: leadingPadding)
-                        }
-                    }
-                    .scrollDisabled(false) // 允许原生滚动
-                    .onAppear {
-                        // 初始时滚动到当前照片位置
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                            if !photos.isEmpty && currentIndex >= 0 && currentIndex < photos.count {
-                                withAnimation(.easeInOut(duration: 0.3)) {
-                                    proxy.scrollTo(currentIndex, anchor: .center)
-                                }
-                            }
-                        }
-                    }
-                    .onChange(of: currentIndex) { newIndex in
-                        // 当外部改变currentIndex时，滚动到对应位置
-                        if !isDragging {
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                                if !photos.isEmpty && newIndex >= 0 && newIndex < photos.count {
-                                    withAnimation(.easeInOut(duration: 0.3)) {
-                                        proxy.scrollTo(newIndex, anchor: .center)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    .onChange(of: photos.count) { _ in
-                        // 当照片数组发生变化时，确保 currentIndex 在有效范围内
-                        DispatchQueue.main.async {
-                            validateCurrentIndex()
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                                if !photos.isEmpty && currentIndex >= 0 && currentIndex < photos.count {
-                                    withAnimation(.easeInOut(duration: 0.3)) {
-                                        proxy.scrollTo(currentIndex, anchor: .center)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    
-                    // 透明手势层用于检测滑动并计算照片索引
-                    Rectangle()
-                        .fill(Color.clear)
-                        .contentShape(Rectangle())
-                        .gesture(
-                            DragGesture(coordinateSpace: .local)
-                                .onChanged { value in
-                                    if !isDragging {
-                                        isDragging = true
-                                        dragStartIndex = currentIndex
-                                        hapticFeedback.prepare()
-                                        lastHapticIndex = currentIndex
-                                        currentScrollOffset = 0
-                                        print("Started dragging from index: \(currentIndex)")
-                                    }
-                                    
-                                    // 计算滑动距离
-                                    let translation = value.translation.width
-                                    currentScrollOffset = translation
-                                    
-                                    // 根据滑动距离计算新的照片索引
-                                    let sensitivity: CGFloat = 1.0
-                                    let indexChange = -translation / (totalThumbnailWidth * sensitivity)
-                                    let targetIndex = Double(dragStartIndex) + Double(indexChange)
-                                    let newIndex = max(0, min(photos.count - 1, Int(round(targetIndex))))
-                                    
-                                    print("Translation: \(translation), Target index: \(newIndex)")
-                                    
-                                    // 实时更新照片索引实现快速浏览
-                                    if newIndex != currentIndex && newIndex < photos.count {
-                                        currentIndex = newIndex
-                                        
-                                        // 让缩略图条滚动到对应位置
-                                        proxy.scrollTo(newIndex, anchor: .center)
-                                        
-                                        // 触觉反馈
-                                        if newIndex != lastHapticIndex {
-                                            hapticFeedback.impactOccurred()
-                                            lastHapticIndex = newIndex
-                                        }
-                                        
-                                        print("Updated to index: \(newIndex)")
-                                    }
-                                }
-                                .onEnded { value in
-                                    print("Drag ended at index: \(currentIndex)")
-                                    
-                                    // 确保最终位置居中
-                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                                        if !photos.isEmpty && currentIndex >= 0 && currentIndex < photos.count {
-                                            withAnimation(.easeInOut(duration: 0.3)) {
-                                                proxy.scrollTo(currentIndex, anchor: .center)
-                                            }
-                                        }
-                                    }
-                                    
-                                    // 重置状态
-                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                                        isDragging = false
-                                        lastHapticIndex = -1
-                                        currentScrollOffset = 0
-                                    }
-                                }
-                        )
-                    
-                    // 中心指示器
-                    VStack {
-                        Spacer()
-                        Rectangle()
-                            .fill(Color.white.opacity(0.8))
-                            .frame(width: 2, height: 10)
-                            .cornerRadius(1)
-                        Spacer().frame(height: 2)
-                    }
-                    .allowsHitTesting(false)
-                }
-                
-                // 左右渐变遮罩
-                HStack {
-                    LinearGradient(
-                        gradient: Gradient(colors: [Color.black.opacity(0.8), Color.clear]),
-                        startPoint: .leading,
-                        endPoint: .trailing
-                    )
-                    .frame(width: 30)
-                    .allowsHitTesting(false)
-                    
-                    Spacer()
-                    
-                    LinearGradient(
-                        gradient: Gradient(colors: [Color.clear, Color.black.opacity(0.8)]),
-                        startPoint: .leading,
-                        endPoint: .trailing
-                    )
-                    .frame(width: 30)
-                    .allowsHitTesting(false)
-                }
-            }
-        }
-        .frame(height: 60)
-    }
-    
-    private func validateCurrentIndex() {
-        if photos.isEmpty {
-            currentIndex = 0
-        } else if currentIndex >= photos.count {
-            currentIndex = photos.count - 1
-        } else if currentIndex < 0 {
-            currentIndex = 0
-        }
-    }
-}
-
-// MARK: - ScrollOffset Preference Key (保留以备后用)
-struct ScrollOffsetPreferenceKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
-    
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = nextValue()
-    }
-}
-
-// MARK: - Enhanced Filmstrip Thumbnail
-struct FilmstripThumbnail: View {
-    let photo: PhotoItem
-    let isSelected: Bool
-    let size: CGFloat
-    let isDragging: Bool
-    
-    var body: some View {
-        Group {
-            if let image = photo.image {
-                Image(uiImage: image)
-                    .resizable()
-                    .aspectRatio(contentMode: .fill)
-                    .frame(width: size, height: size)
-                    .clipped()
-            } else {
-                // 占位图片，如果图片加载失败
-                Rectangle()
-                    .fill(Color.gray.opacity(0.5))
-                    .frame(width: size, height: size)
-                    .overlay(
-                        Image(systemName: "photo")
-                            .foregroundColor(.gray)
-                            .font(.caption)
-                    )
-            }
-        }
-        .cornerRadius(4)
-        .overlay(
-            RoundedRectangle(cornerRadius: 4)
-                .stroke(
-                    isSelected ? Color.white : Color.white.opacity(0.3),
-                    lineWidth: isSelected ? 2 : 1
-                )
-        )
-        .opacity(isSelected ? 1.0 : 0.6)
-        .scaleEffect(isSelected ? 1.0 : 0.85)
-        // 拖拽时增强高亮效果
-        .overlay(
-            RoundedRectangle(cornerRadius: 4)
-                .fill(Color.white.opacity(isDragging && isSelected ? 0.2 : 0))
-        )
-        .animation(.easeInOut(duration: isDragging ? 0.1 : 0.2), value: isSelected)
+        HighResAsyncImageView(fileName: photo.fileName)
     }
 }
