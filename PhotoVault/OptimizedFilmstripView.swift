@@ -1,6 +1,6 @@
 import SwiftUI
 
-// MARK: - Fixed Optimized Filmstrip View (No Conflicts)
+// MARK: - Fixed Optimized Filmstrip View (Updated for EnhancedImageCache)
 struct OptimizedFilmstripView: View {
     let photos: [PhotoItem]
     @Binding var currentIndex: Int
@@ -227,14 +227,19 @@ struct OptimizedFilmstripView: View {
         }
     }
     
-    // MARK: - 预加载
+    // MARK: - 预加载 (更新为使用 EnhancedImageCache)
     private func preloadNearbyThumbnails() {
         let range = max(0, currentIndex - 3)...min(photos.count - 1, currentIndex + 3)
         let nearbyPhotos = range.map { photos[$0].fileName }
         
-        ImageCache.shared.preloadThumbnails(
-            for: nearbyPhotos,
-            size: CGSize(width: thumbnailSize * 2, height: thumbnailSize * 2)
-        )
+        // 🔄 使用 EnhancedImageCache 替代 ImageCache
+        for fileName in nearbyPhotos {
+            EnhancedImageCache.shared.getThumbnail(
+                for: fileName,
+                size: CGSize(width: thumbnailSize * 2, height: thumbnailSize * 2)
+            ) { _ in
+                // 预加载，不需要处理结果
+            }
+        }
     }
 }

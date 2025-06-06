@@ -7,8 +7,6 @@ struct PhotoItem: Identifiable, Hashable, Codable {
     let id = UUID()
     let fileName: String
     
-    // 移除原来的 image computed property，现在通过缓存系统获取图片
-    
     init(image: UIImage) {
         self.fileName = "\(UUID().uuidString).jpg"
         self.saveImage(image)
@@ -38,8 +36,8 @@ struct PhotoItem: Identifiable, Hashable, Codable {
         }
         let imagePath = documentsPath.appendingPathComponent(fileName)
         
-        // 从缓存中移除
-        ImageCache.shared.removeCachedImage(for: fileName)
+        // 从增强缓存中移除
+        EnhancedImageCache.shared.removeCachedImage(for: fileName)
         
         // 删除文件
         try? FileManager.default.removeItem(at: imagePath)
@@ -47,11 +45,15 @@ struct PhotoItem: Identifiable, Hashable, Codable {
     
     // MARK: - 缓存辅助方法
     func loadImageAsync(completion: @escaping (UIImage?) -> Void) {
-        ImageCache.shared.getImageAsync(for: fileName, completion: completion)
+        EnhancedImageCache.shared.getImageWithSeamlessUpgrade(
+            for: fileName,
+            onThumbnail: { _ in }, // 忽略缩略图回调
+            onHighRes: completion
+        )
     }
     
     func loadThumbnail(size: CGSize, completion: @escaping (UIImage?) -> Void) {
-        ImageCache.shared.getThumbnail(for: fileName, size: size, completion: completion)
+        EnhancedImageCache.shared.getThumbnail(for: fileName, size: size, completion: completion)
     }
     
     // 检查文件是否存在
@@ -112,7 +114,7 @@ struct DocumentPickerView: UIViewControllerRepresentable {
     }
 }
 
-// MARK: - Optimized View Model
+// MARK: - Enhanced Photo Gallery View Model
 class PhotoGalleryViewModel: ObservableObject {
     @Published var photos: [PhotoItem] = []
     @Published var selectedPhotoItem: PhotoItem?
@@ -148,8 +150,8 @@ class PhotoGalleryViewModel: ObservableObject {
             
             DispatchQueue.main.async {
                 self?.photos = validPhotos
-                // 开始预加载缩略图
-                self?.preloadThumbnails()
+                // 开始智能预加载
+                self?.triggerInitialPreload()
             }
         }
     }
@@ -202,8 +204,8 @@ class PhotoGalleryViewModel: ObservableObject {
                 }
                 
                 await MainActor.run {
-                    // 开始预加载新添加的照片的缩略图
-                    self.preloadThumbnails()
+                    // 开始预加载新添加的照片
+                    self.triggerInitialPreload()
                 }
                 
             } catch {
@@ -213,7 +215,7 @@ class PhotoGalleryViewModel: ObservableObject {
     }
     
     func deletePhoto(_ photo: PhotoItem) {
-        photo.deleteImageFile() // 删除本地文件
+        photo.deleteImageFile() // 删除本地文件和缓存
         photos.removeAll { $0.id == photo.id }
         savePhotos() // 保存更新后的列表
     }
@@ -253,7 +255,7 @@ class PhotoGalleryViewModel: ObservableObject {
         selectedPhotos.removeAll()
     }
     
-    // 改进的selectPhoto方法，包含预加载
+    // 改进的selectPhoto方法，包含智能预加载
     func selectPhoto(_ photo: PhotoItem) {
         selectedPhotoItem = photo
         showingImageDetail = true
@@ -274,29 +276,43 @@ class PhotoGalleryViewModel: ObservableObject {
         showingDocumentPicker = true
     }
     
-    // MARK: - Performance Optimization Methods
+    // MARK: - 🚀 Enhanced Performance Optimization Methods
     
-    // 预加载缩略图
-    func preloadThumbnails() {
-        let thumbnailSize = CGSize(width: 240, height: 240) // Grid用的缩略图
+    // 初始预加载
+    func triggerInitialPreload() {
+        guard !photos.isEmpty else { return }
+        
         let fileNames = photos.map { $0.fileName }
         
-        DispatchQueue.global(qos: .utility).async {
-            ImageCache.shared.preloadThumbnails(for: fileNames, size: thumbnailSize)
+        // 预加载前20张照片的缩略图
+        for (index, fileName) in fileNames.prefix(20).enumerated() {
+            EnhancedImageCache.shared.getThumbnail(
+                for: fileName,
+                size: CGSize(width: 240, height: 240)
+            ) { _ in }
         }
+        
+        // 预加载前10张照片的原图
+        EnhancedImageCache.shared.preloadVisiblePhotos(
+            fileNames,
+            currentIndex: 0,
+            visibleRange: 10
+        )
     }
     
     // 预加载当前照片附近的高分辨率图片（用于详细视图）
     func preloadNearbyHighResImages(around index: Int) {
-        let range = max(0, index - 2)...min(photos.count - 1, index + 2)
-        
-        for i in range {
-            if i < photos.count {
-                photos[i].loadImageAsync { _ in
-                    // 预加载，不需要处理结果
-                }
-            }
-        }
+        let allFileNames = photos.map { $0.fileName }
+        EnhancedImageCache.shared.preloadVisiblePhotos(
+            allFileNames,
+            currentIndex: index,
+            visibleRange: 8
+        )
+    }
+    
+    // 清理缓存
+    func clearCache() {
+        EnhancedImageCache.shared.clearCache()
     }
 }
 
@@ -306,6 +322,323 @@ extension Array {
         return stride(from: 0, to: count, by: size).map {
             Array(self[$0..<Swift.min($0 + size, count)])
         }
+    }
+}
+
+// MARK: - 🚀 无缝升级图片视图
+struct SeamlessImageView: View {
+    let fileName: String
+    let contentMode: ContentMode
+    
+    @State private var displayImage: UIImage?
+    @State private var isHighRes = false
+    @State private var loadingTask: Task<Void, Never>?
+    
+    init(fileName: String, contentMode: ContentMode = .fit) {
+        self.fileName = fileName
+        self.contentMode = contentMode
+    }
+    
+    var body: some View {
+        Group {
+            if let image = displayImage {
+                Image(uiImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: contentMode)
+                    .opacity(isHighRes ? 1.0 : 0.9) // 高分辨率时完全不透明
+                    .animation(.easeInOut(duration: 0.3), value: isHighRes)
+            } else {
+                // 加载中的占位符
+                Rectangle()
+                    .fill(Color.gray.opacity(0.3))
+                    .overlay(
+                        VStack(spacing: 16) {
+                            ProgressView()
+                                .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                                .scaleEffect(1.2)
+                            
+                            Text("Loading...")
+                                .foregroundColor(.white)
+                                .font(.caption)
+                        }
+                    )
+            }
+        }
+        .onAppear {
+            loadImageSeamlessly()
+        }
+        .onDisappear {
+            cancelLoading()
+        }
+        .onChange(of: fileName) { _ in
+            cancelLoading()
+            loadImageSeamlessly()
+        }
+    }
+    
+    private func loadImageSeamlessly() {
+        loadingTask = Task {
+            await MainActor.run {
+                displayImage = nil
+                isHighRes = false
+            }
+            
+            // 使用增强缓存的无缝加载功能
+            EnhancedImageCache.shared.getImageWithSeamlessUpgrade(
+                for: fileName,
+                thumbnailSize: CGSize(width: 600, height: 600), // 使用较大的缩略图作为占位符
+                onThumbnail: { thumbnailImage in
+                    if !Task.isCancelled {
+                        self.displayImage = thumbnailImage
+                        self.isHighRes = false
+                    }
+                },
+                onHighRes: { highResImage in
+                    if !Task.isCancelled && highResImage != nil {
+                        self.displayImage = highResImage
+                        self.isHighRes = true
+                    }
+                }
+            )
+        }
+    }
+    
+    private func cancelLoading() {
+        loadingTask?.cancel()
+        loadingTask = nil
+    }
+}
+
+// MARK: - 🎯 智能预加载网格视图
+struct SmartPreloadGridView: View {
+    @EnvironmentObject var viewModel: PhotoGalleryViewModel
+    @State private var visiblePhotos: Set<String> = []
+    
+    let columns = [
+        GridItem(.flexible(), spacing: 1),
+        GridItem(.flexible(), spacing: 1),
+        GridItem(.flexible(), spacing: 1)
+    ]
+    
+    var body: some View {
+        ScrollView {
+            LazyVGrid(columns: columns, spacing: 1) {
+                ForEach(Array(viewModel.photos.enumerated()), id: \.element.id) { index, photo in
+                    SmartGridCell(photo: photo, index: index)
+                        .onAppear {
+                            handlePhotoAppeared(photo: photo, index: index)
+                        }
+                        .onDisappear {
+                            handlePhotoDisappeared(photo: photo)
+                        }
+                }
+            }
+            .padding(4)
+        }
+        .onAppear {
+            // 初始预加载
+            viewModel.triggerInitialPreload()
+        }
+    }
+    
+    private func handlePhotoAppeared(photo: PhotoItem, index: Int) {
+        visiblePhotos.insert(photo.fileName)
+        
+        // 触发智能预加载
+        let allFileNames = viewModel.photos.map { $0.fileName }
+        EnhancedImageCache.shared.preloadVisiblePhotos(
+            allFileNames,
+            currentIndex: index,
+            visibleRange: 8 // 预加载当前位置前后8张照片的原图
+        )
+    }
+    
+    private func handlePhotoDisappeared(photo: PhotoItem) {
+        visiblePhotos.remove(photo.fileName)
+    }
+}
+
+// MARK: - 🔥 高性能网格单元格
+struct SmartGridCell: View {
+    let photo: PhotoItem
+    let index: Int
+    @EnvironmentObject var viewModel: PhotoGalleryViewModel
+    
+    var isSelected: Bool {
+        viewModel.selectedPhotos.contains(photo)
+    }
+    
+    var body: some View {
+        GeometryReader { geometry in
+            ZStack(alignment: .topTrailing) {
+                // 使用优化的AsyncImageView
+                AsyncImageView(
+                    fileName: photo.fileName,
+                    targetSize: CGSize(
+                        width: geometry.size.width * 2,
+                        height: geometry.size.height * 2
+                    ),
+                    contentMode: .fill
+                )
+                .frame(width: geometry.size.width, height: geometry.size.height)
+                .clipped()
+                .cornerRadius(12)
+                .onTapGesture {
+                    if viewModel.isSelectionMode {
+                        viewModel.togglePhotoSelection(photo)
+                    } else {
+                        // 点击时立即预加载附近照片的原图
+                        preloadNearbyHighResImages()
+                        viewModel.selectPhoto(photo)
+                    }
+                }
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12)
+                        .fill(Color.blue.opacity(viewModel.isSelectionMode && isSelected ? 0.3 : 0))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12)
+                        .stroke(Color.blue, lineWidth: viewModel.isSelectionMode && isSelected ? 3 : 0)
+                )
+                
+                if viewModel.isSelectionMode {
+                    // 选择指示器
+                    ZStack {
+                        Circle()
+                            .fill(Color.white)
+                            .frame(width: 24, height: 24)
+                        
+                        if isSelected {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundColor(.blue)
+                                .font(.title3)
+                        } else {
+                            Circle()
+                                .stroke(Color.gray, lineWidth: 2)
+                                .frame(width: 20, height: 20)
+                        }
+                    }
+                    .padding(8)
+                }
+            }
+        }
+        .aspectRatio(1, contentMode: .fit)
+    }
+    
+    private func preloadNearbyHighResImages() {
+        let allFileNames = viewModel.photos.map { $0.fileName }
+        EnhancedImageCache.shared.preloadVisiblePhotos(
+            allFileNames,
+            currentIndex: index,
+            visibleRange: 5 // 预加载当前照片前后5张的原图
+        )
+    }
+}
+
+// MARK: - ⚡ 优化的详细视图
+struct OptimizedImageDetailView: View {
+    @EnvironmentObject var viewModel: PhotoGalleryViewModel
+    @State private var currentIndex: Int = 0
+    @State private var dragOffset: CGSize = .zero
+    @State private var scale: CGFloat = 1.0
+    
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            
+            if viewModel.photos.isEmpty {
+                Color.clear
+                    .onAppear {
+                        viewModel.showingImageDetail = false
+                    }
+            } else {
+                VStack {
+                    Spacer()
+                    
+                    // 使用无缝升级的图片视图
+                    TabView(selection: $currentIndex) {
+                        ForEach(Array(viewModel.photos.enumerated()), id: \.element.id) { index, photo in
+                            SeamlessImageView(fileName: photo.fileName, contentMode: .fit)
+                                .tag(index)
+                        }
+                    }
+                    .tabViewStyle(.page(indexDisplayMode: .never))
+                    .scaleEffect(scale)
+                    .offset(x: dragOffset.width, y: dragOffset.height)
+                    .gesture(
+                        DragGesture()
+                            .onChanged { value in
+                                if value.translation.height > 0 {
+                                    dragOffset = value.translation
+                                    let dragProgress = min(value.translation.height / 200, 1.0)
+                                    scale = 1.0 - (dragProgress * 0.3)
+                                }
+                            }
+                            .onEnded { value in
+                                if value.translation.height > 100 {
+                                    viewModel.showingImageDetail = false
+                                } else {
+                                    withAnimation(.easeInOut(duration: 0.3)) {
+                                        dragOffset = .zero
+                                        scale = 1.0
+                                    }
+                                }
+                            }
+                    )
+                    .onAppear {
+                        updateCurrentIndex()
+                        triggerAdvancedPreload()
+                    }
+                    .onChange(of: currentIndex) { newIndex in
+                        // 切换照片时预加载附近照片
+                        triggerAdvancedPreload()
+                    }
+                    .onChange(of: viewModel.photos) { _ in
+                        updateCurrentIndex()
+                    }
+                    
+                    Spacer()
+                    
+                    // 优化的缩略图条
+                    OptimizedFilmstripView(
+                        photos: viewModel.photos,
+                        currentIndex: $currentIndex
+                    )
+                    .opacity(1.0 - min(dragOffset.height / 100, 1.0))
+                    .padding(.bottom, 50)
+                }
+            }
+        }
+    }
+    
+    private func updateCurrentIndex() {
+        guard !viewModel.photos.isEmpty else {
+            viewModel.showingImageDetail = false
+            return
+        }
+        
+        if let selectedPhoto = viewModel.selectedPhotoItem,
+           let newIndex = viewModel.photos.firstIndex(where: { $0.id == selectedPhoto.id }) {
+            currentIndex = newIndex
+        } else {
+            if currentIndex >= viewModel.photos.count {
+                currentIndex = max(0, viewModel.photos.count - 1)
+            }
+            if currentIndex < viewModel.photos.count {
+                viewModel.selectedPhotoItem = viewModel.photos[currentIndex]
+            }
+        }
+    }
+    
+    private func triggerAdvancedPreload() {
+        let allFileNames = viewModel.photos.map { $0.fileName }
+        
+        // 预加载当前照片前后10张的原图
+        EnhancedImageCache.shared.preloadVisiblePhotos(
+            allFileNames,
+            currentIndex: currentIndex,
+            visibleRange: 10
+        )
     }
 }
 
@@ -336,16 +669,15 @@ struct ContentView: View {
                         }
                     } else {
                         HStack {
-                            // 添加性能监控按钮（可选）
-                            PerformanceMonitorButton()
+                            // 性能监控按钮
+                            EnhancedPerformanceButton()
                             
-                            // 可选：添加状态指示器
+                            // 状态指示器
                             StatusBadge(isMetalEnabled: MetalImageProcessor.isSupported)
                         }
                     }
                 }
                 
-                // 其他toolbar items保持不变...
                 ToolbarItem(placement: .navigationBarTrailing) {
                     HStack {
                         if viewModel.isSelectionMode {
@@ -439,227 +771,167 @@ struct EmptyStateView: View {
     }
 }
 
-// MARK: - Optimized Photo Grid View
+// MARK: - Photo Grid View (使用智能预加载)
 struct PhotoGridView: View {
     @EnvironmentObject var viewModel: PhotoGalleryViewModel
     
-    // 调整为更紧凑的布局
-    let columns = [
-        GridItem(.flexible(), spacing: 1),  // 减少spacing从2到1
-        GridItem(.flexible(), spacing: 1),
-        GridItem(.flexible(), spacing: 1)
-    ]
-    
     var body: some View {
-        ScrollView {
-            LazyVGrid(columns: columns, spacing: 1) {  // 减少垂直spacing从2到1
-                ForEach(viewModel.photos) { photo in
-                    PhotoGridCell(photo: photo)
-                        .onAppear {
-                            // 当item出现时，预加载附近的缩略图
-                            preloadNearbyThumbnails(for: photo)
-                        }
-                        .onDisappear {
-                            // 当item消失时，可以清理一些不必要的缓存
-                            // 但我们保留缓存以提高性能
-                        }
-                }
-            }
-            .padding(4)  // 减少外边距从8到4
-        }
-        .onAppear {
-            // 视图出现时开始预加载
-            viewModel.preloadThumbnails()
-        }
-    }
-    
-    private func preloadNearbyThumbnails(for photo: PhotoItem) {
-        guard let currentIndex = viewModel.photos.firstIndex(where: { $0.id == photo.id }) else { return }
-        
-        // 预加载当前照片前后5张的缩略图
-        let range = max(0, currentIndex - 5)...min(viewModel.photos.count - 1, currentIndex + 5)
-        let nearbyPhotos = range.map { viewModel.photos[$0].fileName }
-        
-        ImageCache.shared.preloadThumbnails(
-            for: nearbyPhotos,
-            size: CGSize(width: 240, height: 240)
-        )
+        SmartPreloadGridView()
+            .environmentObject(viewModel)
     }
 }
 
-// MARK: - Optimized Photo Grid Cell
-struct PhotoGridCell: View {
-    let photo: PhotoItem
-    @EnvironmentObject var viewModel: PhotoGalleryViewModel
-    
-    var isSelected: Bool {
-        viewModel.selectedPhotos.contains(photo)
-    }
-    
-    var body: some View {
-        GeometryReader { geometry in
-            ZStack(alignment: .topTrailing) {
-                // 使用新的AsyncImageView替代原来的同步图片加载
-                AsyncImageView(
-                    fileName: photo.fileName,
-                    targetSize: CGSize(
-                        width: geometry.size.width * 2, // 2x for retina
-                        height: geometry.size.height * 2
-                    ),
-                    contentMode: .fill
-                )
-                .frame(width: geometry.size.width, height: geometry.size.height)
-                .clipped()
-                .cornerRadius(12)
-                .onTapGesture {
-                    if viewModel.isSelectionMode {
-                        viewModel.togglePhotoSelection(photo)
-                    } else {
-                        viewModel.selectPhoto(photo)
-                    }
-                }
-                .overlay(
-                    // 选择模式下的遮罩
-                    RoundedRectangle(cornerRadius: 12)
-                        .fill(Color.blue.opacity(viewModel.isSelectionMode && isSelected ? 0.3 : 0))
-                )
-                .overlay(
-                    // 选择边框
-                    RoundedRectangle(cornerRadius: 12)
-                        .stroke(Color.blue, lineWidth: viewModel.isSelectionMode && isSelected ? 3 : 0)
-                )
-                
-                if viewModel.isSelectionMode {
-                    // 选择指示器
-                    ZStack {
-                        Circle()
-                            .fill(Color.white)
-                            .frame(width: 24, height: 24)
-                        
-                        if isSelected {
-                            Image(systemName: "checkmark.circle.fill")
-                                .foregroundColor(.blue)
-                                .font(.title3)
-                        } else {
-                            Circle()
-                                .stroke(Color.gray, lineWidth: 2)
-                                .frame(width: 20, height: 20)
-                        }
-                    }
-                    .padding(8)
-                }
-            }
-        }
-        .aspectRatio(1, contentMode: .fit)
-    }
-}
-
-// MARK: - Image Detail View
+// MARK: - Image Detail View (使用无缝加载)
 struct ImageDetailView: View {
     @EnvironmentObject var viewModel: PhotoGalleryViewModel
-    @State private var currentIndex: Int = 0
-    @State private var dragOffset: CGSize = .zero
-    @State private var scale: CGFloat = 1.0
     
     var body: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
+        OptimizedImageDetailView()
+            .environmentObject(viewModel)
+    }
+}
+
+// MARK: - 📊 增强性能监控按钮
+struct EnhancedPerformanceButton: View {
+    @State private var showingMonitor = false
+    
+    var body: some View {
+        Button {
+            showingMonitor = true
+        } label: {
+            Image(systemName: "speedometer")
+                .font(.title2)
+        }
+        .sheet(isPresented: $showingMonitor) {
+            EnhancedPerformanceView()
+        }
+    }
+}
+
+struct EnhancedPerformanceView: View {
+    @State private var stats: [String: Any] = [:]
+    
+    var body: some View {
+        NavigationView {
+            List {
+                systemSection
+                cacheSection
+                performanceSection
+                controlSection
+            }
+            .navigationTitle("Performance Monitor")
+            .navigationBarTitleDisplayMode(.inline)
+            .onAppear {
+                updateStats()
+            }
+        }
+    }
+    
+    private var systemSection: some View {
+        Section("System") {
+            HStack {
+                Label("Metal Support", systemImage: "cpu")
+                Spacer()
+                if stats["metal_supported"] as? Bool == true {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundColor(.green)
+                } else {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundColor(.red)
+                }
+            }
             
-            // 如果没有照片了，自动关闭详细视图
-            if viewModel.photos.isEmpty {
-                Color.clear
-                    .onAppear {
-                        viewModel.showingImageDetail = false
-                    }
-            } else {
-                VStack {
+            if let deviceName = stats["device_name"] as? String {
+                HStack {
+                    Label("Device", systemImage: "display")
                     Spacer()
-                    
-                    // Image Viewer - 简单的 TabView 滑动
-                    TabView(selection: $currentIndex) {
-                        ForEach(Array(viewModel.photos.enumerated()), id: \.element.id) { index, photo in
-                            SimpleImageView(photo: photo)
-                                .tag(index)
-                        }
-                    }
-                    .tabViewStyle(.page(indexDisplayMode: .never))
-                    .scaleEffect(scale)
-                    .offset(x: dragOffset.width, y: dragOffset.height)
-                    .gesture(
-                        DragGesture()
-                            .onChanged { value in
-                                // 只响应向下滑动
-                                if value.translation.height > 0 {
-                                    dragOffset = value.translation
-                                    // 根据拖拽距离计算缩放比例
-                                    let dragProgress = min(value.translation.height / 200, 1.0)
-                                    scale = 1.0 - (dragProgress * 0.3) // 最多缩小到70%
-                                }
-                            }
-                            .onEnded { value in
-                                // 如果向下滑动超过100像素，关闭详细视图
-                                if value.translation.height > 100 {
-                                    viewModel.showingImageDetail = false
-                                } else {
-                                    // 否则弹回原位
-                                    withAnimation(.easeInOut(duration: 0.3)) {
-                                        dragOffset = .zero
-                                        scale = 1.0
-                                    }
-                                }
-                            }
-                    )
-                    .onAppear {
-                        updateCurrentIndex()
-                    }
-                    .onChange(of: viewModel.photos) { _ in
-                        // 当照片数组发生变化时，重新计算当前索引
-                        updateCurrentIndex()
-                    }
-                    
-                    Spacer()
-                    
-                    // 底部缩略图条 - 使用优化版本
-                    OptimizedFilmstripView(
-                        photos: viewModel.photos,
-                        currentIndex: $currentIndex
-                    )
-                    .opacity(1.0 - min(dragOffset.height / 100, 1.0)) // 滑动时淡出
-                    .padding(.bottom, 50)
+                    Text(deviceName)
+                        .foregroundColor(.secondary)
+                        .font(.caption)
                 }
             }
         }
     }
     
-    private func updateCurrentIndex() {
-        // 如果没有照片，直接返回
-        guard !viewModel.photos.isEmpty else {
-            viewModel.showingImageDetail = false
-            return
-        }
-        
-        // 如果有选中的照片，尝试找到它的新索引
-        if let selectedPhoto = viewModel.selectedPhotoItem,
-           let newIndex = viewModel.photos.firstIndex(where: { $0.id == selectedPhoto.id }) {
-            currentIndex = newIndex
-        } else {
-            // 如果当前选中的照片已被删除，调整到有效范围内
-            if currentIndex >= viewModel.photos.count {
-                currentIndex = max(0, viewModel.photos.count - 1)
+    private var cacheSection: some View {
+        Section("Smart Cache") {
+            if let hitCount = stats["cache_hit_count"] as? Int,
+               let missCount = stats["cache_miss_count"] as? Int {
+                
+                HStack {
+                    Label("Cache Hits", systemImage: "checkmark.circle")
+                    Spacer()
+                    Text("\(hitCount)")
+                        .foregroundColor(.green)
+                }
+                
+                HStack {
+                    Label("Cache Misses", systemImage: "xmark.circle")
+                    Spacer()
+                    Text("\(missCount)")
+                        .foregroundColor(.orange)
+                }
+                
+                if let hitRate = stats["cache_hit_rate"] as? Double {
+                    HStack {
+                        Label("Hit Rate", systemImage: "percent")
+                        Spacer()
+                        Text("\(Int(hitRate * 100))%")
+                            .foregroundColor(hitRate > 0.8 ? .green : .orange)
+                    }
+                }
             }
-            // 更新 selectedPhotoItem 为当前显示的照片
-            if currentIndex < viewModel.photos.count {
-                viewModel.selectedPhotoItem = viewModel.photos[currentIndex]
+            
+            if let preloadingCount = stats["preloading_count"] as? Int {
+                HStack {
+                    Label("Preloading", systemImage: "arrow.down.circle")
+                    Spacer()
+                    Text("\(preloadingCount)")
+                        .foregroundColor(.blue)
+                }
             }
         }
+    }
+    
+    private var performanceSection: some View {
+        Section("Performance") {
+            HStack {
+                Label("Seamless Upgrades", systemImage: "bolt.circle")
+                Spacer()
+                Text("Enabled")
+                    .foregroundColor(.green)
+            }
+            
+            HStack {
+                Label("Smart Preloading", systemImage: "brain")
+                Spacer()
+                Text("Active")
+                    .foregroundColor(.green)
+            }
+        }
+    }
+    
+    private var controlSection: some View {
+        Section("Controls") {
+            Button(action: {
+                EnhancedImageCache.shared.clearCache()
+                updateStats()
+            }) {
+                Label("Clear Cache", systemImage: "trash")
+                    .foregroundColor(.red)
+            }
+            
+            Button(action: {
+                updateStats()
+            }) {
+                Label("Refresh Stats", systemImage: "arrow.clockwise")
+            }
+        }
+    }
+    
+    private func updateStats() {
+        stats = EnhancedImageCache.shared.getPerformanceStats()
     }
 }
 
-// MARK: - Optimized Simple Image View
-struct SimpleImageView: View {
-    let photo: PhotoItem
-    
-    var body: some View {
-        HighResAsyncImageView(fileName: photo.fileName)
-    }
-}
+// StatusBadge 已在 PerformanceMonitorView.swift 中定义

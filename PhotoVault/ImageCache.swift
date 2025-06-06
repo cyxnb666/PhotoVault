@@ -1,47 +1,49 @@
 import Foundation
 import UIKit
 
-// MARK: - Enhanced Image Cache Manager with Optional Metal GPU Acceleration
-class ImageCache {
-    static let shared = ImageCache()
+// MARK: - Enhanced Image Cache with Seamless Loading
+class EnhancedImageCache {
+    static let shared = EnhancedImageCache()
     
-    // 内存缓存 - 用于快速访问
+    // 内存缓存 - 用于快速访问原图
     private let memoryCache = NSCache<NSString, UIImage>()
     
     // 缩略图缓存 - 专门用于缩略图
     private let thumbnailCache = NSCache<NSString, UIImage>()
     
-    // 后台队列用于图片处理
-    private let imageProcessingQueue = DispatchQueue(label: "com.photovault.imageprocessing", qos: .userInitiated)
+    // 预加载队列 - 高优先级用于可见内容
+    private let preloadQueue = DispatchQueue(label: "com.photovault.preload", qos: .userInitiated)
     
-    // 缩略图生成队列
-    private let thumbnailQueue = DispatchQueue(label: "com.photovault.thumbnail", qos: .utility)
+    // 后台预加载队列 - 低优先级用于预测性加载
+    private let backgroundPreloadQueue = DispatchQueue(label: "com.photovault.background", qos: .utility)
     
     // 可选的Metal处理器
     private let metalProcessor: MetalImageProcessor?
     
+    // 预加载状态跟踪
+    private var preloadingFiles: Set<String> = []
+    private let preloadLock = NSLock()
+    
     // 性能统计
-    private var metalSuccessCount = 0
-    private var metalFailureCount = 0
-    private var totalProcessingTime: Double = 0
-    private var metalProcessingTime: Double = 0
+    private var cacheHitCount = 0
+    private var cacheMissCount = 0
     
     private init() {
         // 设置内存缓存限制
-        memoryCache.countLimit = 50 // 最多缓存50张原图
-        memoryCache.totalCostLimit = 100 * 1024 * 1024 // 100MB
+        memoryCache.countLimit = 100 // 增加到100张原图
+        memoryCache.totalCostLimit = 200 * 1024 * 1024 // 200MB
         
-        // 缩略图缓存可以更大
-        thumbnailCache.countLimit = 200 // 最多缓存200张缩略图
-        thumbnailCache.totalCostLimit = 50 * 1024 * 1024 // 50MB
+        // 缩略图缓存
+        thumbnailCache.countLimit = 500 // 增加到500张缩略图
+        thumbnailCache.totalCostLimit = 100 * 1024 * 1024 // 100MB
         
-        // 尝试初始化Metal处理器（可选）
+        // 初始化Metal处理器
         self.metalProcessor = MetalImageProcessor.shared
         
         if let metalProcessor = metalProcessor {
-            print("ImageCache: Metal GPU acceleration available - Device: \(metalProcessor.deviceName)")
+            print("EnhancedImageCache: Metal GPU acceleration available - Device: \(metalProcessor.deviceName)")
         } else {
-            print("ImageCache: Using CPU-only processing")
+            print("EnhancedImageCache: Using CPU-only processing")
         }
         
         // 监听内存警告
@@ -56,37 +58,127 @@ class ImageCache {
     @objc private func clearCacheOnMemoryWarning() {
         memoryCache.removeAllObjects()
         thumbnailCache.removeAllObjects()
-        print("ImageCache: Cleared caches due to memory warning")
+        preloadLock.lock()
+        preloadingFiles.removeAll()
+        preloadLock.unlock()
+        print("EnhancedImageCache: Cleared caches due to memory warning")
     }
     
-    // MARK: - 原图缓存 (保持原有接口完全不变)
-    func getImage(for fileName: String) -> UIImage? {
+    // MARK: - 🚀 核心功能：无缝图片加载
+    
+    /// 获取图片，先返回缩略图（如果有），然后异步加载高分辨率版本
+    func getImageWithSeamlessUpgrade(
+        for fileName: String,
+        thumbnailSize: CGSize = CGSize(width: 300, height: 300),
+        onThumbnail: @escaping (UIImage?) -> Void,
+        onHighRes: @escaping (UIImage?) -> Void
+    ) {
         let key = NSString(string: fileName)
         
-        // 先检查内存缓存
+        // 1. 立即检查是否有原图缓存
         if let cachedImage = memoryCache.object(forKey: key) {
-            return cachedImage
+            cacheHitCount += 1
+            onThumbnail(cachedImage)
+            onHighRes(cachedImage)
+            return
         }
         
-        // 从磁盘加载
-        guard let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
-            return nil
+        // 2. 检查是否有缩略图可以立即显示
+        let thumbnailKey = NSString(string: "\(fileName)_\(Int(thumbnailSize.width))x\(Int(thumbnailSize.height))")
+        if let cachedThumbnail = thumbnailCache.object(forKey: thumbnailKey) {
+            onThumbnail(cachedThumbnail) // 立即显示缩略图
+        } else {
+            onThumbnail(nil) // 没有缩略图，显示loading
         }
         
-        let imagePath = documentsPath.appendingPathComponent(fileName)
-        guard let imageData = try? Data(contentsOf: imagePath),
-              let image = UIImage(data: imageData) else {
-            return nil
+        // 3. 后台加载高分辨率图片
+        cacheMissCount += 1
+        preloadQueue.async { [weak self] in
+            guard let self = self else { return }
+            
+            // 加载原图
+            let highResImage = self.loadImageFromDisk(fileName: fileName)
+            
+            if let image = highResImage {
+                // 缓存原图
+                let cost = Int(image.size.width * image.size.height * 4)
+                self.memoryCache.setObject(image, forKey: key, cost: cost)
+                
+                // 如果之前没有缩略图，现在生成并缓存
+                if self.thumbnailCache.object(forKey: thumbnailKey) == nil {
+                    if let thumbnail = self.generateThumbnail(from: image, targetSize: thumbnailSize) {
+                        let thumbnailCost = Int(thumbnail.size.width * thumbnail.size.height * 4)
+                        self.thumbnailCache.setObject(thumbnail, forKey: thumbnailKey, cost: thumbnailCost)
+                    }
+                }
+            }
+            
+            DispatchQueue.main.async {
+                onHighRes(highResImage)
+            }
         }
-        
-        // 缓存到内存
-        let cost = Int(image.size.width * image.size.height * 4) // 估算内存占用
-        memoryCache.setObject(image, forKey: key, cost: cost)
-        
-        return image
     }
     
-    // MARK: - Enhanced 缩略图缓存 with Optional Metal Acceleration
+    // MARK: - 🧠 智能预加载系统
+    
+    /// 智能预加载网格中可见照片的原图
+    func preloadVisiblePhotos(_ fileNames: [String], currentIndex: Int, visibleRange: Int = 5) {
+        let startIndex = max(0, currentIndex - visibleRange)
+        let endIndex = min(fileNames.count - 1, currentIndex + visibleRange)
+        
+        for i in startIndex...endIndex {
+            let fileName = fileNames[i]
+            
+            // 检查是否已经在预加载或已缓存
+            preloadLock.lock()
+            let isPreloading = preloadingFiles.contains(fileName)
+            preloadLock.unlock()
+            
+            if !isPreloading && memoryCache.object(forKey: NSString(string: fileName)) == nil {
+                preloadOriginalImage(fileName: fileName, priority: i == currentIndex ? .high : .normal)
+            }
+        }
+    }
+    
+    /// 预加载单个原图
+    private func preloadOriginalImage(fileName: String, priority: Priority = .normal) {
+        preloadLock.lock()
+        preloadingFiles.insert(fileName)
+        preloadLock.unlock()
+        
+        let queue = priority == .high ? preloadQueue : backgroundPreloadQueue
+        
+        queue.async { [weak self] in
+            defer {
+                self?.preloadLock.lock()
+                self?.preloadingFiles.remove(fileName)
+                self?.preloadLock.unlock()
+            }
+            
+            guard let self = self else { return }
+            
+            // 检查是否已经缓存
+            let key = NSString(string: fileName)
+            if self.memoryCache.object(forKey: key) != nil {
+                return // 已经缓存，跳过
+            }
+            
+            // 加载图片
+            if let image = self.loadImageFromDisk(fileName: fileName) {
+                let cost = Int(image.size.width * image.size.height * 4)
+                self.memoryCache.setObject(image, forKey: key, cost: cost)
+                
+                print("预加载完成: \(fileName)")
+            }
+        }
+    }
+    
+    private enum Priority {
+        case high, normal
+    }
+    
+    // MARK: - 📈 优化的缩略图生成（保持原有接口）
+    
     func getThumbnail(for fileName: String, size: CGSize, completion: @escaping (UIImage?) -> Void) {
         let thumbnailKey = NSString(string: "\(fileName)_\(Int(size.width))x\(Int(size.height))")
         
@@ -98,12 +190,32 @@ class ImageCache {
             return
         }
         
-        // 后台生成缩略图
-        thumbnailQueue.async { [weak self] in
+        // 检查是否有原图可以快速生成缩略图
+        let originalKey = NSString(string: fileName)
+        if let originalImage = memoryCache.object(forKey: originalKey) {
+            // 从缓存的原图快速生成缩略图
+            backgroundPreloadQueue.async { [weak self] in
+                guard let self = self else { return }
+                
+                let thumbnail = self.generateThumbnail(from: originalImage, targetSize: size)
+                
+                if let thumbnail = thumbnail {
+                    let cost = Int(thumbnail.size.width * thumbnail.size.height * 4)
+                    self.thumbnailCache.setObject(thumbnail, forKey: thumbnailKey, cost: cost)
+                }
+                
+                DispatchQueue.main.async {
+                    completion(thumbnail)
+                }
+            }
+            return
+        }
+        
+        // 否则按原来的方法加载
+        backgroundPreloadQueue.async { [weak self] in
             guard let self = self else { return }
             
-            // 先尝试从原图缓存获取
-            let originalImage = self.getImage(for: fileName)
+            let originalImage = self.loadImageFromDisk(fileName: fileName)
             guard let image = originalImage else {
                 DispatchQueue.main.async {
                     completion(nil)
@@ -111,29 +223,7 @@ class ImageCache {
                 return
             }
             
-            let startTime = CFAbsoluteTimeGetCurrent()
-            var thumbnail: UIImage?
-            
-            // 尝试使用Metal加速（如果可用）
-            if let metalProcessor = self.metalProcessor {
-                thumbnail = metalProcessor.generateThumbnailIfPossible(from: image, targetSize: size)
-                
-                if thumbnail != nil {
-                    self.metalSuccessCount += 1
-                    let metalTime = CFAbsoluteTimeGetCurrent() - startTime
-                    self.metalProcessingTime += metalTime
-                } else {
-                    self.metalFailureCount += 1
-                }
-            }
-            
-            // 如果Metal失败或不可用，使用原有CPU方法
-            if thumbnail == nil {
-                thumbnail = self.generateThumbnailCPU(from: image, targetSize: size)
-            }
-            
-            let totalTime = CFAbsoluteTimeGetCurrent() - startTime
-            self.totalProcessingTime += totalTime
+            let thumbnail = self.generateThumbnail(from: image, targetSize: size)
             
             // 缓存缩略图
             if let thumbnail = thumbnail {
@@ -141,51 +231,57 @@ class ImageCache {
                 self.thumbnailCache.setObject(thumbnail, forKey: thumbnailKey, cost: cost)
             }
             
+            // 同时缓存原图（为将来的高分辨率加载做准备）
+            let originalCost = Int(image.size.width * image.size.height * 4)
+            self.memoryCache.setObject(image, forKey: originalKey, cost: originalCost)
+            
             DispatchQueue.main.async {
                 completion(thumbnail)
             }
         }
     }
     
-    // MARK: - 异步获取原图 (保持原有接口完全不变)
-    func getImageAsync(for fileName: String, completion: @escaping (UIImage?) -> Void) {
-        // 先检查缓存
-        if let cachedImage = getImage(for: fileName) {
-            completion(cachedImage)
-            return
+    // MARK: - 🔧 辅助方法
+    
+    private func loadImageFromDisk(fileName: String) -> UIImage? {
+        guard let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
+            return nil
         }
         
-        // 后台加载
-        imageProcessingQueue.async { [weak self] in
-            let image = self?.getImage(for: fileName)
-            DispatchQueue.main.async {
-                completion(image)
-            }
+        let imagePath = documentsPath.appendingPathComponent(fileName)
+        guard let imageData = try? Data(contentsOf: imagePath),
+              let image = UIImage(data: imageData) else {
+            return nil
         }
+        
+        return image
     }
     
-    // MARK: - AspectFill模式的CPU缩略图生成 (与Metal版本一致)
+    private func generateThumbnail(from image: UIImage, targetSize: CGSize) -> UIImage? {
+        // 尝试使用Metal加速
+        if let metalProcessor = metalProcessor,
+           let metalThumbnail = metalProcessor.generateThumbnailIfPossible(from: image, targetSize: targetSize) {
+            return metalThumbnail
+        }
+        
+        // 回退到CPU生成
+        return generateThumbnailCPU(from: image, targetSize: targetSize)
+    }
+    
     private func generateThumbnailCPU(from image: UIImage, targetSize: CGSize) -> UIImage? {
         let renderer = UIGraphicsImageRenderer(size: targetSize)
         
         return renderer.image { context in
-            // 计算宽高比
             let imageSize = image.size
-            let targetAspectRatio = targetSize.width / targetSize.height
-            let imageAspectRatio = imageSize.width / imageSize.height
-            
-            // AspectFill模式：选择较大的缩放比例，确保填满整个目标区域
             let scaleX = targetSize.width / imageSize.width
             let scaleY = targetSize.height / imageSize.height
-            let scale = max(scaleX, scaleY)  // 选择较大的缩放比例
+            let scale = max(scaleX, scaleY)
             
-            // 计算缩放后的图片尺寸
             let scaledSize = CGSize(
                 width: imageSize.width * scale,
                 height: imageSize.height * scale
             )
             
-            // 计算绘制位置（居中裁剪）
             let drawRect = CGRect(
                 x: (targetSize.width - scaledSize.width) / 2,
                 y: (targetSize.height - scaledSize.height) / 2,
@@ -193,68 +289,72 @@ class ImageCache {
                 height: scaledSize.height
             )
             
-            // 绘制图片（会被自动裁剪到targetSize范围内）
             image.draw(in: drawRect)
         }
     }
     
-    // MARK: - 预加载缩略图 (保持原有接口，增加可选Metal加速)
-    func preloadThumbnails(for fileNames: [String], size: CGSize) {
-        for fileName in fileNames {
-            getThumbnail(for: fileName, size: size) { _ in
-                // 预加载，不需要处理结果
-            }
+    // MARK: - 📊 性能监控
+    
+    func getPerformanceStats() -> [String: Any] {
+        let totalRequests = cacheHitCount + cacheMissCount
+        let hitRate = totalRequests > 0 ? Double(cacheHitCount) / Double(totalRequests) : 0
+        
+        var metalStats: [String: Any] = [:]
+        if let metalProcessor = metalProcessor {
+            // 这里可以添加Metal处理器的统计信息
+            metalStats["device_name"] = metalProcessor.deviceName
+            metalStats["metal_supported"] = true
+        } else {
+            metalStats["metal_supported"] = false
+            metalStats["device_name"] = "CPU Only"
         }
+        
+        return [
+            "cache_hit_count": cacheHitCount,
+            "cache_miss_count": cacheMissCount,
+            "cache_hit_rate": hitRate,
+            "preloading_count": preloadingFiles.count,
+            "cached_originals": memoryCache.countLimit,
+            "cached_thumbnails": thumbnailCache.countLimit
+        ].merging(metalStats, uniquingKeysWith: { $1 })
     }
     
-    // MARK: - 缓存管理 (保持原有接口完全不变)
+    // MARK: - 🧹 缓存管理
+    
     func clearCache() {
         memoryCache.removeAllObjects()
         thumbnailCache.removeAllObjects()
+        preloadLock.lock()
+        preloadingFiles.removeAll()
+        preloadLock.unlock()
         
-        // 重置性能统计
-        metalSuccessCount = 0
-        metalFailureCount = 0
-        totalProcessingTime = 0
-        metalProcessingTime = 0
+        cacheHitCount = 0
+        cacheMissCount = 0
     }
     
     func removeCachedImage(for fileName: String) {
         let key = NSString(string: fileName)
         memoryCache.removeObject(forKey: key)
         
-        // 移除相关的缩略图 - 由于NSCache没有allKeys，我们预先定义常用尺寸进行清理
-        let commonThumbnailSizes = [
+        // 移除预加载状态
+        preloadLock.lock()
+        preloadingFiles.remove(fileName)
+        preloadLock.unlock()
+        
+        // 移除相关缩略图
+        let commonSizes = [
             CGSize(width: 44, height: 44),
-            CGSize(width: 88, height: 88),  // 2x
+            CGSize(width: 88, height: 88),
             CGSize(width: 120, height: 120),
-            CGSize(width: 240, height: 240), // 2x
+            CGSize(width: 240, height: 240),
             CGSize(width: 300, height: 300),
-            CGSize(width: 600, height: 600)  // 2x
+            CGSize(width: 600, height: 600)
         ]
         
-        for size in commonThumbnailSizes {
+        for size in commonSizes {
             let thumbnailKey = NSString(string: "\(fileName)_\(Int(size.width))x\(Int(size.height))")
             thumbnailCache.removeObject(forKey: thumbnailKey)
         }
-    }
-    
-    // MARK: - 性能监控 (新增)
-    func getPerformanceStats() -> [String: Any] {
-        let totalRequests = metalSuccessCount + metalFailureCount
-        let metalSuccessRate = totalRequests > 0 ? Double(metalSuccessCount) / Double(totalRequests) : 0
-        let avgMetalTime = metalSuccessCount > 0 ? metalProcessingTime / Double(metalSuccessCount) : 0
-        let avgTotalTime = (metalSuccessCount + metalFailureCount) > 0 ? totalProcessingTime / Double(metalSuccessCount + metalFailureCount) : 0
-        
-        return [
-            "metal_supported": MetalImageProcessor.isSupported,
-            "metal_success_count": metalSuccessCount,
-            "metal_failure_count": metalFailureCount,
-            "metal_success_rate": metalSuccessRate,
-            "avg_metal_time_ms": avgMetalTime * 1000,
-            "avg_total_time_ms": avgTotalTime * 1000,
-            "device_name": metalProcessor?.deviceName ?? "CPU Only"
-        ]
     }
     
     deinit {

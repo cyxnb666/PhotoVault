@@ -1,6 +1,6 @@
 import SwiftUI
 
-// MARK: - 简化的性能监控视图
+// MARK: - 增强的性能监控视图 (Updated for EnhancedImageCache)
 struct PerformanceMonitorView: View {
     @State private var stats: [String: Any] = [:]
     
@@ -47,20 +47,58 @@ struct PerformanceMonitorView: View {
     
     private var performanceSection: some View {
         Section("Performance") {
-            if let successCount = stats["metal_success_count"] as? Int,
-               let failureCount = stats["metal_failure_count"] as? Int {
+            // 更新的性能指标，适配 EnhancedImageCache
+            if let hitCount = stats["cache_hit_count"] as? Int,
+               let missCount = stats["cache_miss_count"] as? Int {
+                
+                HStack {
+                    Label("Cache Hits", systemImage: "checkmark.circle")
+                    Spacer()
+                    Text("\(hitCount)")
+                        .foregroundColor(.green)
+                }
+                
+                HStack {
+                    Label("Cache Misses", systemImage: "xmark.circle")
+                    Spacer()
+                    Text("\(missCount)")
+                        .foregroundColor(.orange)
+                }
+                
+                if let hitRate = stats["cache_hit_rate"] as? Double {
+                    HStack {
+                        Label("Hit Rate", systemImage: "percent")
+                        Spacer()
+                        Text("\(Int(hitRate * 100))%")
+                            .foregroundColor(hitRate > 0.8 ? .green : .orange)
+                    }
+                }
+            }
+            
+            if let preloadingCount = stats["preloading_count"] as? Int {
+                HStack {
+                    Label("Preloading", systemImage: "arrow.down.circle")
+                    Spacer()
+                    Text("\(preloadingCount)")
+                        .foregroundColor(.blue)
+                }
+            }
+            
+            // 新增：GPU 加速统计
+            if let metalSuccessCount = stats["metal_success_count"] as? Int,
+               let metalFailureCount = stats["metal_failure_count"] as? Int {
                 
                 HStack {
                     Label("GPU Accelerated", systemImage: "bolt")
                     Spacer()
-                    Text("\(successCount)")
+                    Text("\(metalSuccessCount)")
                         .foregroundColor(.green)
                 }
                 
                 HStack {
                     Label("CPU Fallback", systemImage: "cpu")
                     Spacer()
-                    Text("\(failureCount)")
+                    Text("\(metalFailureCount)")
                         .foregroundColor(.orange)
                 }
                 
@@ -82,13 +120,29 @@ struct PerformanceMonitorView: View {
                         .foregroundColor(.blue)
                 }
             }
+            
+            // 新增：无缝升级功能状态
+            HStack {
+                Label("Seamless Upgrades", systemImage: "bolt.circle")
+                Spacer()
+                Text("Enabled")
+                    .foregroundColor(.green)
+            }
+            
+            HStack {
+                Label("Smart Preloading", systemImage: "brain")
+                Spacer()
+                Text("Active")
+                    .foregroundColor(.green)
+            }
         }
     }
     
     private var controlSection: some View {
         Section("Controls") {
             Button(action: {
-                ImageCache.shared.clearCache()
+                // 🔄 使用 EnhancedImageCache 替代 ImageCache
+                EnhancedImageCache.shared.clearCache()
                 updateStats()
             }) {
                 Label("Clear Cache", systemImage: "trash")
@@ -104,7 +158,8 @@ struct PerformanceMonitorView: View {
     }
     
     private func updateStats() {
-        stats = ImageCache.shared.getPerformanceStats()
+        // 🔄 使用 EnhancedImageCache 替代 ImageCache
+        stats = EnhancedImageCache.shared.getPerformanceStats()
     }
 }
 

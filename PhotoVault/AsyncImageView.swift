@@ -1,7 +1,7 @@
 import SwiftUI
 import UIKit
 
-// MARK: - Async Image View with Caching
+// MARK: - Async Image View with Enhanced Caching
 struct AsyncImageView: View {
     let fileName: String
     let targetSize: CGSize
@@ -56,12 +56,13 @@ struct AsyncImageView: View {
     
     private func loadImage() {
         loadingTask = Task {
-            // 使用缓存系统加载缩略图
+            // 使用增强缓存系统加载缩略图
             await MainActor.run {
                 isLoading = true
             }
             
-            ImageCache.shared.getThumbnail(for: fileName, size: targetSize) { loadedImage in
+            // 🔄 使用 EnhancedImageCache 替代 ImageCache
+            EnhancedImageCache.shared.getThumbnail(for: fileName, size: targetSize) { loadedImage in
                 if !Task.isCancelled {
                     self.image = loadedImage
                     self.isLoading = false
@@ -139,24 +140,26 @@ struct HighResAsyncImageView: View {
                 image = nil
             }
             
-            // 先显示缩略图作为占位符
-            ImageCache.shared.getThumbnail(for: fileName, size: CGSize(width: 300, height: 300)) { thumbnailImage in
-                if !Task.isCancelled && self.image == nil {
-                    self.image = thumbnailImage
-                }
-            }
-            
-            // 然后加载高分辨率图片
-            ImageCache.shared.getImageAsync(for: fileName) { highResImage in
-                if !Task.isCancelled {
-                    if let highResImage = highResImage {
-                        self.image = highResImage
-                        self.isLoading = false
-                    } else {
-                        self.isLoading = false
+            // 🔄 使用 EnhancedImageCache 的无缝升级功能
+            EnhancedImageCache.shared.getImageWithSeamlessUpgrade(
+                for: fileName,
+                thumbnailSize: CGSize(width: 300, height: 300),
+                onThumbnail: { thumbnailImage in
+                    if !Task.isCancelled && self.image == nil {
+                        self.image = thumbnailImage
+                    }
+                },
+                onHighRes: { highResImage in
+                    if !Task.isCancelled {
+                        if let highResImage = highResImage {
+                            self.image = highResImage
+                            self.isLoading = false
+                        } else {
+                            self.isLoading = false
+                        }
                     }
                 }
-            }
+            )
         }
     }
     
@@ -203,9 +206,6 @@ struct ThumbnailView: View {
                 )
         )
         .opacity(isSelected ? 1.0 : 0.6)
-        // 移除这里的 scaleEffect 和 animation，让外层控制
-        // .scaleEffect(isSelected ? 1.0 : 0.85)
-        // .animation(.easeInOut(duration: 0.2), value: isSelected)
         .onAppear {
             loadThumbnail()
         }
@@ -218,7 +218,8 @@ struct ThumbnailView: View {
         let thumbnailSize = CGSize(width: size * 2, height: size * 2) // 2x for retina
         
         loadingTask = Task {
-            ImageCache.shared.getThumbnail(for: fileName, size: thumbnailSize) { loadedImage in
+            // 🔄 使用 EnhancedImageCache 替代 ImageCache
+            EnhancedImageCache.shared.getThumbnail(for: fileName, size: thumbnailSize) { loadedImage in
                 if !Task.isCancelled {
                     self.image = loadedImage
                 }
