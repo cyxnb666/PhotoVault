@@ -7,6 +7,7 @@ struct AsyncImageView: View {
     let targetSize: CGSize
     let contentMode: ContentMode
     
+    
     @State private var image: UIImage?
     @State private var isLoading = true
     @State private var loadingTask: Task<Void, Never>?
