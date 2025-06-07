@@ -22,12 +22,13 @@ struct PhotoItem: Identifiable, Hashable, Codable {
         }
         let imagePath = documentsPath.appendingPathComponent(fileName)
         
-        // 后台保存图片，避免阻塞主线程
-        DispatchQueue.global(qos: .utility).async {
-            if let imageData = image.jpegData(compressionQuality: 0.8) {
-                try? imageData.write(to: imagePath)
-            }
+        // 同步保存图片，确保文件完全写入后再继续
+        if let imageData = image.jpegData(compressionQuality: 0.8) {
+            try? imageData.write(to: imagePath)
         }
+        
+        // 立即将图片添加到内存缓存，避免重复读取
+        EnhancedImageCache.shared.preloadImageToCache(image: image, fileName: fileName)
     }
     
     func deleteImageFile() {
@@ -159,8 +160,6 @@ class PhotoGalleryViewModel: ObservableObject {
     // 改进的loadPhotosFromFolder方法，包含进度反馈
     func loadPhotosFromFolder(at url: URL) {
         Task {
-            var newPhotos: [PhotoItem] = []
-            
             guard url.startAccessingSecurityScopedResource() else {
                 print("无法访问所选文件夹")
                 return
@@ -176,36 +175,43 @@ class PhotoGalleryViewModel: ObservableObject {
                 
                 let supportedImageTypes: [UTType] = [.jpeg, .png, .heic, .gif, .bmp, .tiff]
                 
-                // 分批处理图片，避免内存峰值
-                let batchSize = 10
-                for batch in contents.chunked(into: batchSize) {
-                    for fileURL in batch {
+                // 在后台处理所有图片，完成后一次性更新UI
+                let processedPhotos = await withTaskGroup(of: PhotoItem?.self, returning: [PhotoItem].self) { group in
+                    var results: [PhotoItem] = []
+                    
+                    for fileURL in contents {
                         if let resourceValues = try? fileURL.resourceValues(forKeys: [.contentTypeKey]),
                            let contentType = resourceValues.contentType,
                            supportedImageTypes.contains(where: { contentType.conforms(to: $0) }) {
                             
-                            if let imageData = try? Data(contentsOf: fileURL),
-                               let image = UIImage(data: imageData) {
-                                let photoItem = PhotoItem(image: image)
-                                newPhotos.append(photoItem)
+                            group.addTask {
+                                if let imageData = try? Data(contentsOf: fileURL),
+                                   let image = UIImage(data: imageData) {
+                                    return PhotoItem(image: image)
+                                }
+                                return nil
                             }
                         }
                     }
                     
-                    // 每处理一批就更新UI并短暂休息
-                    await MainActor.run {
-                        self.photos.append(contentsOf: newPhotos)
-                        newPhotos.removeAll()
-                        self.savePhotos()
+                    for await result in group {
+                        if let photoItem = result {
+                            results.append(photoItem)
+                        }
                     }
                     
-                    // 短暂休息，避免阻塞主线程
-                    try? await Task.sleep(nanoseconds: 10_000_000) // 10ms
+                    return results
                 }
                 
+                // 一次性更新UI，避免频繁刷新
                 await MainActor.run {
-                    // 开始预加载新添加的照片
-                    self.triggerInitialPreload()
+                    self.photos.append(contentsOf: processedPhotos)
+                    self.savePhotos()
+                    
+                    // 触发预加载
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        self.triggerInitialPreload()
+                    }
                 }
                 
             } catch {
@@ -612,20 +618,23 @@ struct OptimizedImageDetailView: View {
     }
     
     private func updateCurrentIndex() {
-        guard !viewModel.photos.isEmpty else {
-            viewModel.showingImageDetail = false
-            return
-        }
-        
-        if let selectedPhoto = viewModel.selectedPhotoItem,
-           let newIndex = viewModel.photos.firstIndex(where: { $0.id == selectedPhoto.id }) {
-            currentIndex = newIndex
-        } else {
-            if currentIndex >= viewModel.photos.count {
-                currentIndex = max(0, viewModel.photos.count - 1)
+        // 添加延迟检查，给数组更新时间
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            guard !self.viewModel.photos.isEmpty else {
+                self.viewModel.showingImageDetail = false
+                return
             }
-            if currentIndex < viewModel.photos.count {
-                viewModel.selectedPhotoItem = viewModel.photos[currentIndex]
+            
+            if let selectedPhoto = self.viewModel.selectedPhotoItem,
+               let newIndex = self.viewModel.photos.firstIndex(where: { $0.id == selectedPhoto.id }) {
+                self.currentIndex = newIndex
+            } else {
+                if self.currentIndex >= self.viewModel.photos.count {
+                    self.currentIndex = max(0, self.viewModel.photos.count - 1)
+                }
+                if self.currentIndex < self.viewModel.photos.count {
+                    self.viewModel.selectedPhotoItem = self.viewModel.photos[self.currentIndex]
+                }
             }
         }
     }

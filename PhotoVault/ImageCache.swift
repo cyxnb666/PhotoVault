@@ -357,6 +357,32 @@ class EnhancedImageCache {
         }
     }
     
+    // MARK: - 图片预加载到缓存
+    func preloadImageToCache(image: UIImage, fileName: String) {
+        let key = NSString(string: fileName)
+        let cost = Int(image.size.width * image.size.height * 4)
+        memoryCache.setObject(image, forKey: key, cost: cost)
+        
+        // 同时生成一些常用尺寸的缩略图
+        let commonSizes = [
+            CGSize(width: 120, height: 120),
+            CGSize(width: 240, height: 240),
+            CGSize(width: 300, height: 300)
+        ]
+        
+        backgroundPreloadQueue.async { [weak self] in
+            guard let self = self else { return }
+            
+            for size in commonSizes {
+                if let thumbnail = self.generateThumbnail(from: image, targetSize: size) {
+                    let thumbnailKey = NSString(string: "\(fileName)_\(Int(size.width))x\(Int(size.height))")
+                    let thumbnailCost = Int(thumbnail.size.width * thumbnail.size.height * 4)
+                    self.thumbnailCache.setObject(thumbnail, forKey: thumbnailKey, cost: thumbnailCost)
+                }
+            }
+        }
+    }
+    
     deinit {
         NotificationCenter.default.removeObserver(self)
     }

@@ -57,12 +57,14 @@ struct AsyncImageView: View {
     
     private func loadImage() {
         loadingTask = Task {
-            // 使用增强缓存系统加载缩略图
-            await MainActor.run {
-                isLoading = true
+            // 稍微延迟一下再显示loading状态，避免闪烁
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                if self.image == nil && !Task.isCancelled {
+                    self.isLoading = true
+                }
             }
             
-            // 🔄 使用 EnhancedImageCache 替代 ImageCache
+            // 使用增强缓存系统加载缩略图
             EnhancedImageCache.shared.getThumbnail(for: fileName, size: targetSize) { loadedImage in
                 if !Task.isCancelled {
                     self.image = loadedImage
