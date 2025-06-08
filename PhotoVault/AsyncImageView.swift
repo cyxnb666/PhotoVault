@@ -235,3 +235,217 @@ struct ThumbnailView: View {
         loadingTask = nil
     }
 }
+
+// MARK: - 零延迟图片显示组件
+struct ZeroDelayImageView: View {
+    let fileName: String
+    let targetSize: CGSize
+    
+    @State private var displayImage: UIImage?
+    @State private var currentQuality: UltraFastThumbnailGenerator.QualityLevel = .micro
+    @State private var loadingTasks: [Task<Void, Never>] = []
+    
+    var body: some View {
+        Group {
+            if let image = displayImage {
+                Image(uiImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)  // 确保使用 .fill 模式
+                    // 质量提升时的平滑过渡
+                    .transition(.opacity.animation(.easeInOut(duration: 0.15)))
+            } else {
+                // 极简占位符（避免白屏闪烁）
+                Rectangle()
+                    .fill(Color.gray.opacity(0.1))
+            }
+        }
+        .clipped() // 重要：确保裁剪超出部分
+        .onAppear {
+            startProgressiveLoading()
+        }
+        .onDisappear {
+            cancelAllTasks()
+        }
+    }
+    
+    private func startProgressiveLoading() {
+        // 立即显示最小质量图片
+        loadQuality(.micro)
+        
+        // 🔧 调整升级时间，减少变形感知
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) {
+            self.loadQuality(.tiny)
+        }
+        
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            self.loadQuality(.small)
+        }
+        
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            self.loadQuality(.medium)
+        }
+        
+        // 最终高质量版本 - 稍微延迟以确保用户感知到改善
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            self.loadOriginalImage()
+        }
+    }
+    
+    private func loadQuality(_ quality: UltraFastThumbnailGenerator.QualityLevel) {
+        let task = Task {
+            let key = "\(fileName)_\(quality.rawValue)"
+            
+            // 先尝试从缓存获取
+            if let cachedImage = EnhancedImageCache.shared.getCachedThumbnail(key: key) {
+                await MainActor.run {
+                    if !Task.isCancelled && (displayImage == nil || quality.rawValue > currentQuality.rawValue) {
+                        displayImage = cachedImage
+                        currentQuality = quality
+                    }
+                }
+                return
+            }
+            
+            // 如果缓存中没有，快速生成
+            if let originalImage = await loadImageFromDisk() {
+                let thumbnail = UltraFastThumbnailGenerator.shared.generateOptimizedThumbnail(
+                    from: originalImage,
+                    quality: quality
+                )
+                
+                await MainActor.run {
+                    if !Task.isCancelled && (displayImage == nil || quality.rawValue > currentQuality.rawValue) {
+                        displayImage = thumbnail
+                        currentQuality = quality
+                        
+                        // 同时缓存这个质量级别
+                        if let thumbnail = thumbnail {
+                            EnhancedImageCache.shared.cacheThumbnail(thumbnail, forKey: key)
+                        }
+                    }
+                }
+            }
+        }
+        
+        loadingTasks.append(task)
+    }
+    
+    private func loadOriginalImage() {
+        let task = Task {
+            // 使用EnhancedImageCache的无缝升级功能
+            EnhancedImageCache.shared.getImageWithSeamlessUpgrade(
+                for: fileName,
+                onThumbnail: { _ in }, // 已经有渐进式加载了
+                onHighRes: { highResImage in
+                    if !Task.isCancelled, let highResImage = highResImage {
+                        self.displayImage = highResImage
+                    }
+                }
+            )
+        }
+        
+        loadingTasks.append(task)
+    }
+    
+    private func loadImageFromDisk() async -> UIImage? {
+        return await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async {
+                guard let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                
+                let imagePath = documentsPath.appendingPathComponent(fileName)
+                if let imageData = try? Data(contentsOf: imagePath),
+                   let image = UIImage(data: imageData) {
+                    continuation.resume(returning: image)
+                } else {
+                    continuation.resume(returning: nil)
+                }
+            }
+        }
+    }
+    
+    private func cancelAllTasks() {
+        loadingTasks.forEach { $0.cancel() }
+        loadingTasks.removeAll()
+    }
+}
+
+// MARK: - 增强的缩略图视图（替换现有的ThumbnailView）
+struct EnhancedThumbnailView: View {
+    let fileName: String
+    let size: CGFloat
+    let isSelected: Bool
+    
+    @State private var image: UIImage?
+    @State private var loadingTask: Task<Void, Never>?
+    
+    var body: some View {
+        Group {
+            if let image = image {
+                Image(uiImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)  // 确保使用 .fill 模式
+                    .frame(width: size, height: size)
+                    .clipped() // 重要：裁剪超出部分
+            } else {
+                // 使用我们修复后的ZeroDelayImageView
+                ZeroDelayImageView(
+                    fileName: fileName,
+                    targetSize: CGSize(width: size * 2, height: size * 2)
+                )
+                .frame(width: size, height: size)
+                .clipped() // 确保裁剪
+            }
+        }
+        .cornerRadius(4)
+        .overlay(
+            RoundedRectangle(cornerRadius: 4)
+                .stroke(
+                    isSelected ? Color.white : Color.white.opacity(0.3),
+                    lineWidth: isSelected ? 2 : 1
+                )
+        )
+        .opacity(isSelected ? 1.0 : 0.6)
+        .onAppear {
+            startEnhancedLoading()
+        }
+        .onDisappear {
+            cancelLoading()
+        }
+    }
+    
+    private func startEnhancedLoading() {
+        loadingTask = Task {
+            // 先尝试快速显示已缓存的小缩略图
+            let quickKey = "\(fileName)_\(UltraFastThumbnailGenerator.QualityLevel.small.rawValue)"
+            if let quickImage = EnhancedImageCache.shared.getCachedThumbnail(key: quickKey) {
+                await MainActor.run {
+                    if !Task.isCancelled {
+                        self.image = quickImage
+                    }
+                }
+            }
+            
+            // 然后加载更高质量的缩略图
+            let thumbnailSize = CGSize(width: size * 2, height: size * 2)
+            
+            // 🔧 修复布尔值判断错误
+            EnhancedImageCache.shared.getThumbnail(for: fileName, size: thumbnailSize) { loadedImage in
+                Task { @MainActor in
+                    // 正确的可选值判断方式
+                    let taskNotCancelled = self.loadingTask?.isCancelled == false || self.loadingTask == nil
+                    if taskNotCancelled, let loadedImage = loadedImage {
+                        self.image = loadedImage
+                    }
+                }
+            }
+        }
+    }
+    
+    private func cancelLoading() {
+        loadingTask?.cancel()
+        loadingTask = nil
+    }
+}

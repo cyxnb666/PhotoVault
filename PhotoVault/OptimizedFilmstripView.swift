@@ -42,8 +42,8 @@ struct OptimizedFilmstripView: View {
                 Spacer().frame(width: leadingPadding)
                 
                 ForEach(Array(photos.enumerated()), id: \.element.id) { index, photo in
-                    // 使用现有的 ThumbnailView，但控制其动画
-                    ThumbnailView(
+                    // 🔄 使用增强的 ThumbnailView，但控制其动画
+                    EnhancedThumbnailView(
                         fileName: photo.fileName,
                         size: thumbnailSize,
                         isSelected: index == currentIndex
@@ -232,8 +232,23 @@ struct OptimizedFilmstripView: View {
         let range = max(0, currentIndex - 3)...min(photos.count - 1, currentIndex + 3)
         let nearbyPhotos = range.map { photos[$0].fileName }
         
-        // 🔄 使用 EnhancedImageCache 替代 ImageCache
+        // 🔄 使用增强的预加载策略
         for fileName in nearbyPhotos {
+            // 先快速加载小缩略图
+            let smallKey = "\(fileName)_\(UltraFastThumbnailGenerator.QualityLevel.small.rawValue)"
+            if EnhancedImageCache.shared.getCachedThumbnail(key: smallKey) == nil {
+                // 如果没有缓存，触发快速生成
+                DispatchQueue.global(qos: .utility).async {
+                    if let originalImage = self.loadImageFromDisk(fileName: fileName) {
+                        UltraFastThumbnailGenerator.shared.generateAllQualityLevels(
+                            from: originalImage,
+                            fileName: fileName
+                        )
+                    }
+                }
+            }
+            
+            // 同时使用原有的缩略图加载方法作为备份
             EnhancedImageCache.shared.getThumbnail(
                 for: fileName,
                 size: CGSize(width: thumbnailSize * 2, height: thumbnailSize * 2)
@@ -241,5 +256,20 @@ struct OptimizedFilmstripView: View {
                 // 预加载，不需要处理结果
             }
         }
+    }
+
+    // 🆕 添加辅助方法
+    private func loadImageFromDisk(fileName: String) -> UIImage? {
+        guard let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
+            return nil
+        }
+        
+        let imagePath = documentsPath.appendingPathComponent(fileName)
+        guard let imageData = try? Data(contentsOf: imagePath),
+              let image = UIImage(data: imageData) else {
+            return nil
+        }
+        
+        return image
     }
 }

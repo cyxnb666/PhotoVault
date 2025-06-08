@@ -267,21 +267,24 @@ class EnhancedImageCache {
         // 回退到CPU生成
         return generateThumbnailCPU(from: image, targetSize: targetSize)
     }
-    
+
     private func generateThumbnailCPU(from image: UIImage, targetSize: CGSize) -> UIImage? {
         let renderer = UIGraphicsImageRenderer(size: targetSize)
         
         return renderer.image { context in
             let imageSize = image.size
+            
+            // 计算保持宽高比的缩放 (AspectFill模式)
             let scaleX = targetSize.width / imageSize.width
             let scaleY = targetSize.height / imageSize.height
-            let scale = max(scaleX, scaleY)
+            let scale = max(scaleX, scaleY) // 使用较大的缩放比例确保填满
             
             let scaledSize = CGSize(
                 width: imageSize.width * scale,
                 height: imageSize.height * scale
             )
             
+            // 计算居中绘制的矩形
             let drawRect = CGRect(
                 x: (targetSize.width - scaledSize.width) / 2,
                 y: (targetSize.height - scaledSize.height) / 2,
@@ -289,6 +292,11 @@ class EnhancedImageCache {
                 height: scaledSize.height
             )
             
+            // 填充背景色
+            UIColor.black.setFill()
+            context.cgContext.fill(CGRect(origin: .zero, size: targetSize))
+            
+            // 绘制图片
             image.draw(in: drawRect)
         }
     }
@@ -385,5 +393,118 @@ class EnhancedImageCache {
     
     deinit {
         NotificationCenter.default.removeObserver(self)
+    }
+}
+
+extension EnhancedImageCache {
+    // 添加快速缓存查询方法
+    func getCachedThumbnail(key: String) -> UIImage? {
+        return thumbnailCache.object(forKey: NSString(string: key))
+    }
+    
+    // 添加快速缓存存储方法
+    func cacheThumbnail(_ image: UIImage, forKey key: String) {
+        let cost = Int(image.size.width * image.size.height * 4)
+        thumbnailCache.setObject(image, forKey: NSString(string: key), cost: cost)
+    }
+}
+
+// MARK: - 超快速缩略图生成器
+class UltraFastThumbnailGenerator {
+    static let shared = UltraFastThumbnailGenerator()
+    
+    // 预先生成的质量级别
+    enum QualityLevel: Int, CaseIterable {
+        case micro = 1    // 16x16 - 极速显示
+        case tiny = 2     // 64x64 - 快速浏览
+        case small = 3    // 120x120 - 普通缩略图
+        case medium = 4   // 240x240 - 中等质量
+        case large = 5    // 480x480 - 高质量预览
+        
+        var size: CGSize {
+            switch self {
+            case .micro: return CGSize(width: 16, height: 16)
+            case .tiny: return CGSize(width: 64, height: 64)
+            case .small: return CGSize(width: 120, height: 120)
+            case .medium: return CGSize(width: 240, height: 240)
+            case .large: return CGSize(width: 480, height: 480)
+            }
+        }
+        
+        var compressionQuality: CGFloat {
+            switch self {
+            case .micro, .tiny: return 0.3
+            case .small: return 0.5
+            case .medium: return 0.7
+            case .large: return 0.8
+            }
+        }
+    }
+    
+    private init() {}
+    
+    // 生成优化缩略图
+    func generateOptimizedThumbnail(
+        from image: UIImage,
+        quality: QualityLevel
+    ) -> UIImage? {
+        let imageSize = image.size
+        let targetSize = quality.size
+        
+        // 计算保持宽高比的实际绘制尺寸 (AspectFill模式)
+        let scaleX = targetSize.width / imageSize.width
+        let scaleY = targetSize.height / imageSize.height
+        let scale = max(scaleX, scaleY) // 使用较大的缩放比例确保填满
+        
+        let scaledSize = CGSize(
+            width: imageSize.width * scale,
+            height: imageSize.height * scale
+        )
+        
+        // 计算居中裁剪的绘制矩形
+        let drawRect = CGRect(
+            x: (targetSize.width - scaledSize.width) / 2,
+            y: (targetSize.height - scaledSize.height) / 2,
+            width: scaledSize.width,
+            height: scaledSize.height
+        )
+        
+        // 使用最高效的iOS系统API
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1.0 // 避免不必要的缩放
+        format.opaque = true // 性能优化
+        
+        let renderer = UIGraphicsImageRenderer(
+            size: targetSize,
+            format: format
+        )
+        
+        return renderer.image { context in
+            // 填充背景色（防止透明区域）
+            UIColor.black.setFill()
+            context.fill(CGRect(origin: .zero, size: targetSize))
+            
+            // 绘制保持宽高比的图片
+            image.draw(in: drawRect)
+        }
+    }
+    
+    // 生成所有质量级别的缩略图（一次性处理）
+    func generateAllQualityLevels(from image: UIImage, fileName: String) {
+        DispatchQueue.global(qos: .utility).async {
+            for quality in QualityLevel.allCases {
+                if let thumbnail = self.generateOptimizedThumbnail(
+                    from: image,
+                    quality: quality
+                ) {
+                    // 立即缓存到内存
+                    let key = "\(fileName)_\(quality.rawValue)"
+                    EnhancedImageCache.shared.cacheThumbnail(
+                        thumbnail,
+                        forKey: key
+                    )
+                }
+            }
+        }
     }
 }

@@ -29,6 +29,9 @@ struct PhotoItem: Identifiable, Hashable, Codable {
         
         // 立即将图片添加到内存缓存，避免重复读取
         EnhancedImageCache.shared.preloadImageToCache(image: image, fileName: fileName)
+        
+        // 🆕 新增：预生成所有质量级别的缩略图
+        UltraFastThumbnailGenerator.shared.generateAllQualityLevels(from: image, fileName: fileName)
     }
     
     func deleteImageFile() {
@@ -473,21 +476,20 @@ struct SmartGridCell: View {
     var isSelected: Bool {
         viewModel.selectedPhotos.contains(photo)
     }
-    
+
     var body: some View {
         GeometryReader { geometry in
             ZStack(alignment: .topTrailing) {
-                // 使用优化的AsyncImageView
-                AsyncImageView(
+                // 🔄 替换 AsyncImageView 为 ZeroDelayImageView
+                ZeroDelayImageView(
                     fileName: photo.fileName,
                     targetSize: CGSize(
                         width: geometry.size.width * 2,
                         height: geometry.size.height * 2
-                    ),
-                    contentMode: .fill
+                    )
                 )
                 .frame(width: geometry.size.width, height: geometry.size.height)
-                .clipped()
+                .clipped() // 🔧 重要：确保裁剪超出部分
                 .cornerRadius(12)
                 .onTapGesture {
                     if viewModel.isSelectionMode {
@@ -564,8 +566,12 @@ struct OptimizedImageDetailView: View {
                     // 使用无缝升级的图片视图
                     TabView(selection: $currentIndex) {
                         ForEach(Array(viewModel.photos.enumerated()), id: \.element.id) { index, photo in
-                            SeamlessImageView(fileName: photo.fileName, contentMode: .fit)
-                                .tag(index)
+                            ZeroDelayImageView(
+                                fileName: photo.fileName,
+                                targetSize: CGSize(width: 800, height: 600)
+                            )
+                            .aspectRatio(contentMode: .fit) // 🔧 详细视图使用 .fit 以显示完整图片
+                            .tag(index)
                         }
                     }
                     .tabViewStyle(.page(indexDisplayMode: .never))
